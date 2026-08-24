@@ -279,6 +279,155 @@ test('host-target: host build/Release IS staged for a matching target', () => {
   }
 })
 
+// ─── glibc ABI compatibility tests ────────────────────────────────────
+//
+// Regression coverage for the bug this session fixed: a build/Release
+// binary compiled by a different toolchain (e.g. a container/distrobox
+// with a newer glibc than the host that will run the packaged app) got
+// staged and shipped, crashing Electron's main process at launch with
+// "version `GLIBC_2.42' not found" — because node-pty's loadNativeModule()
+// checks build/Release BEFORE prebuilds/, so the bad binary silently
+// shadowed a working one. These write a fake ELF .node with a GLIBC_x.y
+// version string embedded (the same literal bytes a real linker leaves in
+// .dynstr for a versioned symbol) so maxRequiredGlibcVersion/
+// exceedsHostGlibc/stageNodePtyInto exercise the real detection path.
+
+/** Write a fake ELF .node with a GLIBC_<version> symbol-version string embedded. */
+function makeFakeElfNodeWithGlibc(filePath, glibcVersion) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true })
+  const elfHeader = Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x00, 0x00, 0x00, 0x00])
+  const versionString = Buffer.from(`GLIBC_${glibcVersion}\0`, 'latin1')
+  fs.writeFileSync(filePath, Buffer.concat([elfHeader, versionString]))
+}
+
+test.skipIf(process.platform !== 'linux')(
+  'maxRequiredGlibcVersion finds the highest GLIBC_x.y symbol version in an ELF .node',
+  async () => {
+    const { maxRequiredGlibcVersion } = await import('../scripts/stage-native-deps.mjs')
+    const tmp = fs.mkdtempSync(join(os.tmpdir(), 'hermes-stage-'))
+    try {
+      const f = join(tmp, 'multi.node')
+      fs.mkdirSync(tmp, { recursive: true })
+      const elfHeader = Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x00, 0x00, 0x00, 0x00])
+      const versions = Buffer.from('GLIBC_2.8\0GLIBC_2.34\0GLIBC_2.14\0', 'latin1')
+      fs.writeFileSync(f, Buffer.concat([elfHeader, versions]))
+      assert.equal(maxRequiredGlibcVersion(f), '2.34')
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  }
+)
+
+test.skipIf(process.platform !== 'linux')(
+  'maxRequiredGlibcVersion returns null for a binary with no GLIBC version strings',
+  async () => {
+    const { maxRequiredGlibcVersion } = await import('../scripts/stage-native-deps.mjs')
+    const tmp = fs.mkdtempSync(join(os.tmpdir(), 'hermes-stage-'))
+    try {
+      const f = join(tmp, 'no-glibc.node')
+      makeFakeNode(f, 'linux')
+      assert.equal(maxRequiredGlibcVersion(f), null)
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  }
+)
+
+test.skipIf(process.platform !== 'linux')(
+  'exceedsHostGlibc is true for a binary requiring a newer glibc than the host',
+  async () => {
+    const { exceedsHostGlibc } = await import('../scripts/stage-native-deps.mjs')
+    const tmp = fs.mkdtempSync(join(os.tmpdir(), 'hermes-stage-'))
+    try {
+      const f = join(tmp, 'too-new.node')
+      // 9.99 is far beyond any real host's glibc, so this is stable regardless
+      // of what glibc the CI/dev machine actually runs.
+      makeFakeElfNodeWithGlibc(f, '9.99')
+      assert.equal(exceedsHostGlibc(f), true)
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  }
+)
+
+test.skipIf(process.platform !== 'linux')(
+  'exceedsHostGlibc is false for a binary requiring an old, universally-available glibc',
+  async () => {
+    const { exceedsHostGlibc } = await import('../scripts/stage-native-deps.mjs')
+    const tmp = fs.mkdtempSync(join(os.tmpdir(), 'hermes-stage-'))
+    try {
+      const f = join(tmp, 'old.node')
+      // 2.2.5 predates every glibc a CI runner or dev machine plausibly has.
+      makeFakeElfNodeWithGlibc(f, '2.2.5')
+      assert.equal(exceedsHostGlibc(f), false)
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  }
+)
+
+test.skipIf(process.platform !== 'linux')(
+  'host-target: an ABI-incompatible build/Release binary is purged, falling through to a compatible prebuild',
+  () => {
+    const tmp = fs.mkdtempSync(join(os.tmpdir(), 'hermes-stage-'))
+    try {
+      const srcRoot = join(tmp, 'node-pty')
+      const destRoot = join(tmp, 'dest')
+
+      // A host build/Release compiled against a glibc newer than any real
+      // host has (9.99) — this is what a shared checkout built inside a
+      // newer-glibc container/distrobox and run on an older-glibc host
+      // looks like.
+      makeFakeNodePty(srcRoot)
+      makeFakeElfNodeWithGlibc(join(srcRoot, 'build', 'Release', 'pty.node'), '9.99')
+      // A same-platform/arch prebuild that IS compatible (no GLIBC strings
+      // at all in this fixture, so exceedsHostGlibc is false for it).
+      makeFakeNode(join(srcRoot, 'prebuilds', `${process.platform}-${process.arch}`, 'pty.node'), process.platform)
+
+      stageNodePtyInto(srcRoot, destRoot, { platform: process.platform, arch: process.arch })
+
+      assert.equal(
+        existsSync(join(destRoot, 'build', 'Release', 'pty.node')),
+        false,
+        'the ABI-incompatible build/Release binary must be purged, not staged'
+      )
+      assert.equal(
+        existsSync(join(destRoot, 'prebuilds', `${process.platform}-${process.arch}`, 'pty.node')),
+        true,
+        'a compatible prebuild must still be staged as the fallback'
+      )
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  }
+)
+
+test.skipIf(process.platform !== 'linux')(
+  'host-target: a glibc-compatible build/Release binary is staged normally (no false positive)',
+  () => {
+    const tmp = fs.mkdtempSync(join(os.tmpdir(), 'hermes-stage-'))
+    try {
+      const srcRoot = join(tmp, 'node-pty')
+      const destRoot = join(tmp, 'dest')
+
+      makeFakeNodePty(srcRoot)
+      // 2.2.5 predates every glibc a CI runner or dev machine plausibly has,
+      // so this must survive the purge unlike the 9.99 fixture above.
+      makeFakeElfNodeWithGlibc(join(srcRoot, 'build', 'Release', 'pty.node'), '2.2.5')
+
+      stageNodePtyInto(srcRoot, destRoot, { platform: process.platform, arch: process.arch })
+
+      assert.equal(
+        existsSync(join(destRoot, 'build', 'Release', 'pty.node')),
+        true,
+        'a glibc-compatible build/Release binary must still be staged'
+      )
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  }
+)
+
 test.skipIf(process.platform === 'win32')(
   'host-target: staged node-pty resolves an already-unpacked helper and preserves executable helpers',
   async () => {

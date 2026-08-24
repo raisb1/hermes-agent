@@ -181,6 +181,127 @@ export function classifyNativeBinary(filePath) {
   return null
 }
 
+// ─── glibc ABI compatibility (Linux only) ────────────────────────────
+//
+// A `build/Release/*.node` binary is compiled by whatever toolchain ran
+// `npm run build` on THIS machine. On Linux that toolchain's glibc is not
+// guaranteed to match the glibc that will actually run the packaged app —
+// e.g. this repo checkout is shared between a container/distrobox with a
+// newer glibc (used for building) and the host OS with an older glibc
+// (used to run `hermes desktop`). A `.node` file compiled against a newer
+// glibc than the runtime provides fails to `dlopen` with
+// "version `GLIBC_2.42' not found", and because loadNativeModule() (see
+// node-pty's lib/utils.js) checks build/Release BEFORE prebuilds/, a bad
+// build/Release binary shadows a perfectly good prebuild and crashes
+// Electron's main process before any window renders — with no actionable
+// error surfaced to the user.
+//
+// This reads the ELF dynamic symbol version requirements directly (no
+// `objdump`/`readelf` shell-out — keeps this portable and dependency-free)
+// and rejects any build/Release binary that requires a newer glibc than
+// the host currently has, so the caller can fall through to a prebuild or
+// a fresh electron-rebuild instead of shipping a binary that will crash.
+
+/** Read `process.report`'s runtime glibc version, or null off-Linux/unavailable. */
+function hostGlibcVersion() {
+  if (process.platform !== 'linux') return null
+  try {
+    const v = process.report?.getReport()?.header?.glibcVersionRuntime
+    return typeof v === 'string' && v ? v : null
+  } catch {
+    return null
+  }
+}
+
+function compareVersions(a, b) {
+  const pa = a.split('.').map(Number)
+  const pb = b.split('.').map(Number)
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0)
+    if (d !== 0) return d
+  }
+  return 0
+}
+
+/**
+ * Scan an ELF file's dynamic symbol version requirements (.gnu.version_r)
+ * for GLIBC_x.y[.z] strings and return the highest one found, or null if
+ * the file isn't a parseable ELF / has no versioned glibc deps (static,
+ * musl, or non-Linux).
+ *
+ * Implementation note: rather than parsing .gnu.version_r structurally,
+ * this scans the raw bytes for the literal `GLIBC_` symbol version strings
+ * ELF linkers always emit verbatim into .dynstr for versioned symbols.
+ * It is a heuristic, not a full ELF parser, but it is exactly what
+ * `objdump -T | grep GLIBC` does under the hood, and false negatives here
+ * only mean a skipped safety check (same as today), never a false reject.
+ */
+export function maxRequiredGlibcVersion(filePath) {
+  let buf
+  try {
+    buf = readFileSync(filePath)
+  } catch {
+    return null
+  }
+  if (classifyNativeBinary(filePath) !== 'linux') return null
+  const text = buf.toString('latin1')
+  const re = /GLIBC_(\d+\.\d+(?:\.\d+)?)/g
+  let max = null
+  let m
+  while ((m = re.exec(text))) {
+    if (max === null || compareVersions(m[1], max) > 0) max = m[1]
+  }
+  return max
+}
+
+/**
+ * Returns true if `filePath` (an ELF .node built for Linux) requires a
+ * newer glibc than this host provides. Off-Linux, or when either version
+ * is undeterminable, this fails open (returns false) — the check is a
+ * best-effort safety net on top of validateStagedBinaries, not a
+ * replacement for it.
+ */
+export function exceedsHostGlibc(filePath) {
+  const host = hostGlibcVersion()
+  if (!host) return false
+  const required = maxRequiredGlibcVersion(filePath)
+  if (!required) return false
+  return compareVersions(required, host) > 0
+}
+
+/**
+ * Remove any `.node` file under `dir` that requires a newer glibc than this
+ * host provides. Returns the list of `{ file, required }` removed, so the
+ * caller can log why a binary that was just staged is gone again.
+ *
+ * Only meaningful for build/Release: that directory holds a binary this
+ * exact toolchain just compiled, which is the one case where the compiling
+ * machine's glibc and the running machine's glibc can silently diverge
+ * (shared checkout, container build + host run). Prebuilds are downloaded
+ * artifacts built elsewhere against a deliberately old glibc baseline for
+ * broad compatibility, so they are not scanned here.
+ */
+function purgeIncompatibleGlibcBinaries(dir) {
+  if (!existsSync(dir)) return []
+  const removed = []
+  function walk(d) {
+    for (const entry of readdirSync(d, { withFileTypes: true })) {
+      const full = join(d, entry.name)
+      if (entry.isDirectory()) {
+        walk(full)
+        continue
+      }
+      if (!entry.name.endsWith('.node')) continue
+      if (exceedsHostGlibc(full)) {
+        removed.push({ file: full, required: maxRequiredGlibcVersion(full) })
+        rmSync(full, { force: true })
+      }
+    }
+  }
+  walk(dir)
+  return removed
+}
+
 /**
  * Scan the staged destination tree for .node files and verify each one's
  * binary platform matches the requested target. Throws on any mismatch.
@@ -286,6 +407,20 @@ export function stageNodePtyInto(srcRoot, destRoot, { platform = process.platfor
   if (hostMatch) {
     const buildReleaseDir = join(srcRoot, 'build/Release')
     copyBuildRelease(buildReleaseDir, join(destRoot, 'build/Release'))
+    // The binary build/Release just staged was compiled by whatever
+    // toolchain last ran on this checkout, which is not guaranteed to be
+    // THIS host (shared checkout across a container/distrobox and the
+    // host OS is a common setup). Purge it if it needs a newer glibc than
+    // we actually have — see purgeIncompatibleGlibcBinaries doc comment —
+    // so the hasNativeBinary check below correctly falls through to a
+    // prebuild or triggers a fresh, host-native electron-rebuild instead
+    // of shipping a binary that crashes Electron's main process on launch.
+    for (const { file, required } of purgeIncompatibleGlibcBinaries(join(destRoot, 'build/Release'))) {
+      console.warn(
+        `[stage-native-deps] discarded ${file}: requires GLIBC_${required}, ` +
+          `host has ${hostGlibcVersion()}`
+      )
+    }
   }
 
   // Check whether a native binary for this target was staged.
@@ -331,7 +466,10 @@ export function stageNodePtyInto(srcRoot, destRoot, { platform = process.platfor
           `Cannot stage node-pty without a native binary.`
       )
     }
-    // Re-copy build/Release after electron-rebuild populated it.
+    // Re-copy build/Release after electron-rebuild populated it. This run
+    // used THIS host's toolchain (electron-rebuild ran right here, not in
+    // some other container), so its output is by construction glibc-
+    // compatible with this host — no purge needed on this path.
     const buildReleaseDir = join(srcRoot, 'build/Release')
     copyBuildRelease(buildReleaseDir, join(destRoot, 'build/Release'))
   }
