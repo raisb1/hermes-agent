@@ -98,16 +98,40 @@ def _needs_interpreter(bin_path: Path) -> bool:
         # Native binary (uv tool shim, PyInstaller, distro package) — its own
         # loader is self-sufficient.
         return False
-    shebang = head.decode("utf-8", errors="replace").strip().lower()
-    if "python" not in shebang:
+    shebang = head.decode("utf-8", errors="replace").strip()
+    shebang_lower = shebang.lower()
+    if "python" not in shebang_lower:
         # A shell wrapper (e.g. the installer's bash launcher) execs the venv
         # python itself — leave it alone.
         return False
+
+    exe_dir = Path(sys.executable).resolve().parent
+
     # A python shebang pointing INSIDE the running interpreter's environment
     # already resolves correctly; anything else (``/usr/bin/env python3``,
     # a system path) would escape the venv when spawned by the DE.
-    exe_dir = str(Path(sys.executable).resolve().parent)
-    return exe_dir not in shebang
+    #
+    # Compare by REALPATH, not raw shebang text: a venv manager like uv
+    # gives every venv's ``bin/python`` a *symlink* to one shared real
+    # interpreter binary. A perfectly correct shebang
+    # (``#!/path/to/venv/bin/python``) then never contains ``exe_dir`` as a
+    # substring, because ``exe_dir`` is the resolved target, not the venv
+    # path — the old substring check misfired on every such venv and
+    # prefixed a working script with a redundant (and, once resolved
+    # outside its own venv discovery, venv-breaking) interpreter, causing
+    # the desktop launcher to silently crash with ModuleNotFoundError
+    # (Terminal=false hides the traceback). Resolving both sides to their
+    # real path first is what makes the comparison meaningful.
+    shebang_interp = shebang[2:].split()[0] if len(shebang) > 2 else ""
+    try:
+        shebang_dir = Path(shebang_interp).resolve().parent if shebang_interp else None
+    except (OSError, ValueError):
+        shebang_dir = None
+
+    if shebang_dir is not None and shebang_dir == exe_dir:
+        return False
+
+    return str(exe_dir) not in shebang_lower
 
 
 def _quote_exec_arg(arg: str) -> str:

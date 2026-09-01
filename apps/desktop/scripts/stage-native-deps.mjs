@@ -202,12 +202,59 @@ export function classifyNativeBinary(filePath) {
 // the host currently has, so the caller can fall through to a prebuild or
 // a fresh electron-rebuild instead of shipping a binary that will crash.
 
-/** Read `process.report`'s runtime glibc version, or null off-Linux/unavailable. */
+/**
+ * Read the glibc version that will actually run the packaged app at
+ * launch time, or null off-Linux/unavailable.
+ *
+ * `process.report`'s `glibcVersionRuntime` describes the glibc of the
+ * process running THIS SCRIPT — which is wrong when the build runs inside
+ * a container (distrobox/toolbox/podman) whose glibc is newer than the
+ * bare host's that will actually execute the packaged Electron app later.
+ * That mismatch is exactly the scenario this whole check exists to catch
+ * (see the module comment above), so evaluating it from inside the
+ * container defeats the check: it reports the container's own (newer)
+ * glibc as "the host", the comparison always finds the binary
+ * "compatible", and the newer-glibc binary ships anyway — reproducing the
+ * crash this function was written to prevent.
+ *
+ * Detect a container via `/run/.containerenv` (written by
+ * podman/distrobox/toolbox) and, when present, shell out to
+ * `distrobox-host-exec getconf GNU_LIBC_VERSION` to ask the REAL host
+ * instead of the container. Falls back to the in-process reading when not
+ * containerized, when the host-exec bridge is unavailable, or on any
+ * error — never throws, matching the "fails open" contract of the caller.
+ */
 function hostGlibcVersion() {
   if (process.platform !== 'linux') return null
+
+  if (existsSync('/run/.containerenv')) {
+    const bridged = _hostGlibcViaContainerBridge()
+    if (bridged) return bridged
+    // No bridge available (e.g. plain `podman run`, no distrobox-host-exec)
+    // — fall through to the in-process reading. It will be wrong for a
+    // genuinely mismatched container/host pair, but it's the same
+    // (documented) fail-open behavior as an unreadable process.report.
+  }
+
   try {
     const v = process.report?.getReport()?.header?.glibcVersionRuntime
     return typeof v === 'string' && v ? v : null
+  } catch {
+    return null
+  }
+}
+
+/** Ask the real host's glibc version through distrobox's host bridge, or null. */
+function _hostGlibcViaContainerBridge() {
+  try {
+    const result = spawnSync('distrobox-host-exec', ['getconf', 'GNU_LIBC_VERSION'], {
+      encoding: 'utf8',
+      timeout: 5000
+    })
+    if (result.status !== 0 || !result.stdout) return null
+    // Output is "glibc X.Y" — keep only the version token.
+    const m = result.stdout.trim().match(/([0-9]+\.[0-9]+(?:\.[0-9]+)?)/)
+    return m ? m[1] : null
   } catch {
     return null
   }
