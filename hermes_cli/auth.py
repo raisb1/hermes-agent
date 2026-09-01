@@ -526,6 +526,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("TOKENHUB_API_KEY",),
         base_url_env_var="TOKENHUB_BASE_URL",
     ),
+    "tencent-tokenplan": ProviderConfig(
+        id="tencent-tokenplan",
+        name="Tencent TokenPlan",
+        auth_type="api_key",
+        inference_base_url="https://api.lkeap.cloud.tencent.com/plan/anthropic",
+        api_key_env_vars=("TOKENPLAN_API_KEY",),
+        base_url_env_var="TOKENPLAN_BASE_URL",
+    ),
     "ollama-cloud": ProviderConfig(
         id="ollama-cloud",
         name="Ollama Cloud",
@@ -801,8 +809,8 @@ ZAI_ENDPOINTS = [
     # (id, base_url, probe_models, label)
     ("global",        "https://api.z.ai/api/paas/v4",        ["glm-5"],   "Global"),
     ("cn",            "https://open.bigmodel.cn/api/paas/v4", ["glm-5"],   "China"),
-    ("coding-global", "https://api.z.ai/api/coding/paas/v4",  ["glm-5.3", "glm-5.2", "glm-5.1", "glm-5v-turbo", "glm-4.7"], "Global (Coding Plan)"),
-    ("coding-cn",     "https://open.bigmodel.cn/api/coding/paas/v4", ["glm-5.3", "glm-5.2", "glm-5.1", "glm-5v-turbo", "glm-4.7"], "China (Coding Plan)"),
+    ("coding-global", "https://api.z.ai/api/coding/paas/v4",  ["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5v-turbo", "glm-4.7"], "Global (Coding Plan)"),
+    ("coding-cn",     "https://open.bigmodel.cn/api/coding/paas/v4", ["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5v-turbo", "glm-4.7"], "China (Coding Plan)"),
 ]
 
 
@@ -1280,8 +1288,20 @@ def _file_lock(
 
     # On Windows, msvcrt.locking needs the file to have content and the
     # file pointer at position 0. Ensure the lock file has at least 1 byte.
+    # Under real concurrency (many threads/processes racing this same
+    # ensure-content check) this write can collide with another holder's
+    # msvcrt byte-range lock on the same file and raise PermissionError --
+    # uncaught, since it happens before the retry loop below even starts.
+    # A stress test with 20 concurrent Hermes processes reproduced this
+    # deterministically on Windows. It's a best-effort convenience write
+    # (whoever gets there first wins); losing the race here just means the
+    # lock file already has content, so swallow the failure and proceed
+    # straight to the acquire-with-retry loop.
     if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
-        lock_path.write_text(" ", encoding="utf-8")
+        try:
+            lock_path.write_text(" ", encoding="utf-8")
+        except (OSError, PermissionError):
+            pass
 
     with lock_path.open("r+" if msvcrt else "a+", encoding="utf-8") as lock_file:
         deadline = time.monotonic() + max(1.0, timeout_seconds)
@@ -1424,7 +1444,8 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
     # No-op on Windows (POSIX mode bits not enforced); ignore failures.
-    # secure_parent_dir refuses to chmod / or top-level dirs (#25821).
+    # secure_parent_dir refuses to chmod /, top-level dirs, or the
+    # hermes-agent install tree (#25821, #93050).
     secure_parent_dir(auth_file)
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -2185,6 +2206,38 @@ def _get_config_hint_for_unknown_provider(provider_name: str) -> str:
         return ""
 
 
+def _refuse_env_adoption_if_config_corrupt() -> None:
+    """Refuse env-key/pool auto-adoption of openrouter while config.yaml is corrupt.
+
+    When ``~/.hermes/config.yaml`` EXISTS but fails to parse, ``load_config()``
+    falls back to ``DEFAULT_CONFIG`` — so the tier-2 config check above finds
+    no ``model.provider`` and the env-var sniff / pool probe silently adopts
+    the PAID openrouter provider, even though the user's real (broken) config
+    may name a completely different provider (e.g. ``openai-codex``). That is
+    silent real-money spend against the user's actual intent (#81952).
+
+    This probe fires ONLY on the auto path — explicitly requested providers
+    never reach it — and clears itself as soon as the file changes (a fixed
+    config resolves normally on the next call).
+    """
+    try:
+        from hermes_cli.config import get_active_config_parse_failure, get_config_path
+
+        err = get_active_config_parse_failure()
+        if not err:
+            return
+        path = get_config_path()
+    except Exception as e:
+        logger.debug("Could not probe config parse-failure state: %s", e)
+        return
+    raise AuthError(
+        f"config.yaml at {path} is corrupt ({err}) — refusing to auto-select "
+        f"an inference provider from environment keys. Fix the YAML (a backup "
+        f"was saved next to it) or run hermes setup.",
+        code="corrupt_config",
+    )
+
+
 def resolve_provider(
     requested: Optional[str] = None,
     *,
@@ -2236,6 +2289,7 @@ def resolve_provider(
         "mimo": "xiaomi", "xiaomi-mimo": "xiaomi",
         "tencent": "tencent-tokenhub", "tokenhub": "tencent-tokenhub",
         "tencent-cloud": "tencent-tokenhub", "tencentmaas": "tencent-tokenhub",
+        "tokenplan": "tencent-tokenplan", "tencent-lkeap": "tencent-tokenplan",
         "aws": "bedrock", "aws-bedrock": "bedrock", "amazon-bedrock": "bedrock", "amazon": "bedrock",
         "go": "opencode-go", "opencode-go-sub": "opencode-go",
         "kilo": "kilocode", "kilo-code": "kilocode", "kilo-gateway": "kilocode",
@@ -2322,6 +2376,7 @@ def resolve_provider(
     if has_usable_secret(_scoped_key_env("OPENAI_API_KEY")) or has_usable_secret(
         _scoped_key_env("OPENROUTER_API_KEY")
     ):
+        _refuse_env_adoption_if_config_corrupt()
         return "openrouter"
 
     # Auto-detect an OpenRouter credential added via `hermes auth add openrouter`
@@ -2334,10 +2389,13 @@ def resolve_provider(
     try:
         from agent.credential_pool import load_pool as _load_pool
 
-        if _load_pool("openrouter").has_credentials():
-            return "openrouter"
+        _pool_has_creds = _load_pool("openrouter").has_credentials()
     except Exception as e:
+        _pool_has_creds = False
         logger.debug("Could not check OpenRouter credential pool: %s", e)
+    if _pool_has_creds:
+        _refuse_env_adoption_if_config_corrupt()
+        return "openrouter"
 
     # Determine the logged-in OAuth provider up front so the env-key loop below
     # can WARN when an exported API key preempts it (#29285 transparency). The
@@ -2812,7 +2870,8 @@ def _read_qwen_cli_tokens() -> Dict[str, Any]:
 def _save_qwen_cli_tokens(tokens: Dict[str, Any]) -> Path:
     auth_path = _qwen_cli_auth_path()
     auth_path.parent.mkdir(parents=True, exist_ok=True)
-    # secure_parent_dir refuses to chmod / or top-level dirs (#25821).
+    # secure_parent_dir refuses to chmod /, top-level dirs, or the
+    # hermes-agent install tree (#25821, #93050).
     secure_parent_dir(auth_path)
     # Per-process random temp suffix avoids collisions between concurrent
     # writers and stale leftovers from a crashed prior write.
@@ -5628,7 +5687,8 @@ def _write_shared_nous_state(state: Dict[str, Any]) -> None:
         with _nous_shared_store_lock():
             path = _nous_shared_store_path()
             path.parent.mkdir(parents=True, exist_ok=True)
-            # secure_parent_dir refuses to chmod / or top-level dirs (#25821).
+            # secure_parent_dir refuses to chmod /, top-level dirs, or the
+            # hermes-agent install tree (#25821, #93050).
             secure_parent_dir(path)
             tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
             # Create with 0o600 atomically via os.open(O_EXCL) — closes the TOCTOU
