@@ -497,6 +497,28 @@ def _check_and_apply_config_migration(
         # Never let the cron safety net break an otherwise-good update.
         logger.debug("Cron jobs auto-restore check failed: %s", exc)
 
+    # #64160: config.yaml model/provider + MoA safety net. Desktop
+    # update/repair cycles have rewritten user-set model.provider /
+    # model.default and dropped the moa: section — settings the gateway
+    # and cron jobs also consume. Compare the live config against the
+    # same pre-update snapshot and restore only the protected keys.
+    try:
+        from hermes_cli.backup import restore_config_model_settings_if_rewritten
+
+        cfg_restore = restore_config_model_settings_if_rewritten(
+            pre_update_snapshot_id
+        )
+        if cfg_restore:
+            print()
+            print(
+                "  ⚠️  config.yaml user model settings were rewritten during "
+                f"this update — restored {', '.join(cfg_restore['keys'])} "
+                f"from pre-update snapshot {cfg_restore['snapshot_id']}."
+            )
+    except Exception as exc:
+        # Never let the config safety net break an otherwise-good update.
+        logger.debug("Config model-settings auto-restore check failed: %s", exc)
+
     # #66140: run the same cron-jobs safety net for every sibling
     # profile against ITS OWN pre-update snapshot (same-generation by
     # construction — both taken by this run).
@@ -515,6 +537,23 @@ def _check_and_apply_config_migration(
             )
     except Exception as exc:
         logger.debug("Sibling cron auto-restore check failed: %s", exc)
+
+    # #64160: same config model-settings safety net for sibling profiles.
+    try:
+        from hermes_cli.backup import restore_config_model_settings_all_profiles
+
+        for _cfg_restored in restore_config_model_settings_all_profiles(
+            _LAST_SIBLING_SNAPSHOTS
+        ):
+            print()
+            print(
+                f"  ⚠️  Profile '{_cfg_restored['profile']}': config.yaml "
+                f"user model settings were rewritten during this update — "
+                f"restored {', '.join(_cfg_restored['keys'])} from "
+                f"pre-update snapshot {_cfg_restored['snapshot_id']}."
+            )
+    except Exception as exc:
+        logger.debug("Sibling config auto-restore check failed: %s", exc)
 
 
 # Critical files that Hermes must be able to import immediately after an
@@ -6714,6 +6753,15 @@ def _cold_start_windows_gateway_after_update() -> bool:
         "✓ Gateway started via cold-start after update "
         f"(PID: {', '.join(map(str, ready_pids))})"
     )
+    # Persist the PIDs this ✓ vouched for so a death AFTER the updater exits
+    # (parent Job Object teardown, #91675) is reported by the next CLI
+    # invocation instead of staying silent. Best-effort.
+    try:
+        gateway_windows._write_start_attestation(
+            ready_pids, "cold-start after update"
+        )
+    except Exception:
+        pass
     return True
 
 
@@ -7403,6 +7451,52 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
     token["unmapped"] = failed_unmapped
     if failed_profiles or failed_unmapped:
         raise RuntimeError("Could not restart every paused Windows gateway")
+
+    # A truthy return from the launch helpers only proves the detached
+    # watcher process was created — not that the gateway it respawns
+    # survived. A parent Job Object that denies CREATE_BREAKAWAY_FROM_JOB
+    # kills the freshly respawned gateway on updater teardown before it
+    # writes a single log line, yet "✓ Restarting" was printed anyway
+    # (#48820, 3rd/4th repro). Verify a stable gateway process actually
+    # exists before vouching for the resume, using the same
+    # provisional-hit + confirmation-window poll every other spawn path
+    # uses (#91675). all_profiles=True because the resume covers the fleet.
+    if relaunched or unmapped_relaunched:
+        try:
+            from hermes_cli import gateway_windows
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not load Windows gateway liveness helpers: {exc}"
+            ) from exc
+        ready_pids = gateway_windows._wait_for_gateway_ready(
+            timeout_s=30.0, all_profiles=True
+        )
+        if not ready_pids:
+            token["profiles"] = dict(profiles)
+            token["unmapped"] = list(unmapped)
+            print()
+            print(
+                "  ⚠ Windows gateway restart could not be verified — no stable "
+                "gateway process appeared after relaunch."
+            )
+            print(
+                "    (The respawned gateway may have been killed by a parent "
+                "Job Object during updater teardown, #48820.)"
+            )
+            print("    Recover with: hermes gateway restart")
+            raise RuntimeError(
+                "Windows gateway relaunch after update was not verified alive"
+            )
+        # Persist the PIDs this ✓ vouches for so a death AFTER the updater
+        # exits (parent Job Object teardown, #91675) is reported by the next
+        # CLI invocation instead of staying silent. Best-effort.
+        try:
+            gateway_windows._write_start_attestation(
+                ready_pids, "post-update relaunch"
+            )
+        except Exception:
+            pass
+
     token["resume_needed"] = False
 
     if relaunched:
