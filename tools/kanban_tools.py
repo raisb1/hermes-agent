@@ -557,6 +557,8 @@ def _handle_complete(args: dict, **kw) -> str:
     _require_dict_metadata(metadata)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     with _board(args.get("board")) as (kb, conn):
+        from hermes_cli import kanban_db_dispatch as kbd
+        kbd.set_worker_session_id(conn, tid, _own_task_env(tid, "HERMES_SESSION_ID"))
         # Goal-mode pre-completion judge gate (Issue #38367). Prevent workers from bypassing the auxiliary
         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
@@ -641,6 +643,8 @@ def _handle_request_review(args: dict, **kw) -> str:
     # Reviewer is model-supplied free text stored durably on the event payload.
     reviewer = _redact_opt(args.get("reviewer") or None)
     with _board(args.get("board")) as (kb, conn):
+        from hermes_cli import kanban_db_dispatch as kbd
+        kbd.set_worker_session_id(conn, tid, _own_task_env(tid, "HERMES_SESSION_ID"))
         _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
         ok, fail_reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
@@ -677,6 +681,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         ok = kbd.heartbeat_worker(
             conn, tid, note=args.get("note"), expected_run_id=_worker_run_id(tid))
         _check(ok, f"could not heartbeat {tid} (unknown id or not running)")
+        kbd.set_worker_session_id(conn, tid, _own_task_env(tid, "HERMES_SESSION_ID"))
         return _ok(task_id=tid)
 
 

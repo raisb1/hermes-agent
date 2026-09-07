@@ -1107,6 +1107,24 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         _kb._append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
 
 
+def set_worker_session_id(conn: sqlite3.Connection, task_id: str, session_id: Optional[str]) -> None:
+    """Record the worker's own Hermes session id on its current task_runs row (idempotent).
+
+    Only fills a run's ``worker_session_id`` when it is currently NULL, so a stale or
+    replayed call can't overwrite a legitimate value already recorded for that run.
+    """
+    if not session_id:
+        return
+    with _kb.write_txn(conn):
+        run_id = _kb._current_run_id(conn, task_id)
+        if run_id is not None:
+            conn.execute(
+                "UPDATE task_runs SET worker_session_id = ? "
+                "WHERE id = ? AND worker_session_id IS NULL",
+                (session_id, run_id),
+            )
+
+
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     """Reset the unified consecutive-failures counter.
 

@@ -135,6 +135,29 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_populates_worker_session_id_without_heartbeat(worker_env, monkeypatch):
+    """A task that completes before its first heartbeat still gets
+    worker_session_id populated, since kanban_complete stamps it too."""
+    import model_tools
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.registry import invalidate_check_fn_cache
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-complete-1")
+    invalidate_check_fn_cache()
+
+    out = model_tools.handle_function_call(
+        function_name="kanban_complete", function_args={"summary": "done, no heartbeat"})
+    assert json.loads(out).get("ok") is True
+
+    conn = kbc.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run.worker_session_id == "sess-complete-1"
+    finally:
+        conn.close()
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the
@@ -358,6 +381,62 @@ def test_heartbeat_extends_claim_expires(worker_env):
         f"claim_expires={after} is suspiciously close to now={now}; "
         f"expected at least now + {kb.DEFAULT_CLAIM_TTL_SECONDS // 2}"
     )
+
+
+def test_heartbeat_populates_worker_session_id(worker_env, monkeypatch):
+    """kanban_heartbeat, dispatched through the real registry (not the bare
+    handler), records HERMES_SESSION_ID onto the current task_runs row."""
+    import model_tools
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.registry import invalidate_check_fn_cache
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-heartbeat-1")
+    invalidate_check_fn_cache()
+
+    out = model_tools.handle_function_call(
+        function_name="kanban_heartbeat", function_args={"note": "still alive"})
+    assert json.loads(out).get("ok") is True
+
+    conn = kbc.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run.worker_session_id == "sess-heartbeat-1"
+    finally:
+        conn.close()
+
+
+def test_request_review_populates_worker_session_id_without_heartbeat(worker_env, monkeypatch):
+    """kanban_request_review also stamps worker_session_id, so a task that
+    goes straight to review before ever heartbeating still gets it."""
+    import model_tools
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.registry import invalidate_check_fn_cache
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-review-1")
+    # request_review refuses to clear a live claim without proof of run
+    # ownership (expected_run_id) — mirror what the dispatcher sets so the
+    # tool call succeeds like a real worker's would.
+    conn = kbc.connect()
+    try:
+        run_id = kb.get_task(conn, worker_env).current_run_id
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    invalidate_check_fn_cache()
+
+    out = model_tools.handle_function_call(
+        function_name="kanban_request_review",
+        function_args={"summary": "implementation done, please review"})
+    assert json.loads(out).get("ok") is True
+
+    conn = kbc.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run.worker_session_id == "sess-review-1"
+    finally:
+        conn.close()
 
 
 def test_comment_happy_path(worker_env):
