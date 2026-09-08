@@ -435,6 +435,19 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
             ) : null}
           </ContextMenuSubContent>
         </ContextMenuSub>
+        <ContextMenuSeparator />
+        {/* Task History: a NAVIGATION to the kanban plugin's own read-only
+            view (apps/desktop/src/plugins/kanban/history.tsx), scoped to this
+            bot's profile via a `?profile=` URL param — never a stored
+            session-id pointer, and never a canonical-chat interaction, so it
+            does not touch the Bot Mode identity contract above. Local-only:
+            the kanban board lives on THIS backend, so a remote bot's history
+            would silently show nothing useful. */}
+        {!bot.remoteSource && (
+          <ContextMenuItem onSelect={() => host.navigate(`/kanban-history?profile=${encodeURIComponent(bot.name)}`)}>
+            {b.bot.taskHistory}
+          </ContextMenuItem>
+        )}
         {isDefaultBot(bot) ? null : <ContextMenuSeparator />}
         {isDefaultBot(bot) ? null : (
           <ContextMenuItem onSelect={() => onDelete(bot)} variant="destructive">

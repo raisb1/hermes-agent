@@ -23,10 +23,11 @@ import { BotRow } from './bot-row'
 import { translateBots } from './i18n-test-helper'
 import type { RosterRow } from './types'
 
-const { ensureAgent, ensureBotMetadata, notifyError, openRosterBot, requestProfile, warmAgent, warmProfile } =
+const { ensureAgent, ensureBotMetadata, navigate, notifyError, openRosterBot, requestProfile, warmAgent, warmProfile } =
   vi.hoisted(() => ({
     ensureAgent: vi.fn(),
     ensureBotMetadata: vi.fn(),
+    navigate: vi.fn(),
     notifyError: vi.fn(),
     openRosterBot: vi.fn(),
     requestProfile: vi.fn(),
@@ -39,7 +40,7 @@ vi.mock('@hermes/plugin-sdk', async importOriginal => {
 
   return {
     ...sdk,
-    host: { ...sdk.host, ensureAgent, notifyError, requestProfile, warmAgent, warmProfile },
+    host: { ...sdk.host, ensureAgent, navigate, notifyError, requestProfile, warmAgent, warmProfile },
     // The plugin bundle normally lands via `ctx.i18n.register` at load, so
     // without this every localized label in the row renders empty.
     usePluginI18n: () => translateBots
@@ -140,6 +141,33 @@ describe('the menu opens the same forever-chat a row click does', () => {
     fireEvent.click(await screen.findByText('Open Bot Chat'))
 
     expect(openRosterBot.mock.calls).toEqual([[bot]])
+  })
+})
+
+describe('Task History menu entry navigates, never opens a session', () => {
+  it('navigates to the kanban plugin history view scoped to this profile', async () => {
+    const bot = { name: 'alpha' } as RosterRow
+
+    fireEvent.contextMenu(renderRow(bot))
+    fireEvent.click(await screen.findByText('Task History'))
+
+    expect(navigate).toHaveBeenCalledWith('/kanban-history?profile=alpha')
+    expect(openRosterBot).not.toHaveBeenCalled()
+  })
+
+  it('is hidden for a remote (Connections) row — its history lives on another backend', async () => {
+    const bot = {
+      connectionId: 'work',
+      connectionLabel: 'Work',
+      name: 'research',
+      remoteSource: true,
+      sourceScoped: true
+    } as RosterRow
+
+    fireEvent.contextMenu(renderRow(bot))
+    await screen.findByText('Open Bot Chat')
+
+    expect(screen.queryByText('Task History')).toBeNull()
   })
 })
 
