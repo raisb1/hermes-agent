@@ -2,9 +2,12 @@
  * Task History (apps/desktop/src/plugins/kanban/history.tsx) — the desktop's
  * read-only per-profile run log (t_1d80ef7d).
  *
- * Covers the card's two required behaviors:
+ * Covers the card's required behaviors:
  *  - the view renders a list of runs from a mocked REST response, grouped by
  *    task id;
+ *  - each run row shows its id, status, outcome (when distinct from status),
+ *    and summary — a failed run's error text does not silently swallow its
+ *    summary;
  *  - a run with `worker_session_id` renders an "Open transcript" affordance
  *    (once `session.list` resolves it to a live session id); one without
  *    does not.
@@ -131,6 +134,49 @@ describe('renders runs grouped by task id', () => {
     renderPage()
 
     expect(await screen.findByText('No runs yet for this profile.')).toBeTruthy()
+  })
+})
+
+describe('a run row renders its id, status, outcome, and summary', () => {
+  it('renders the run id and status for a plain completed run', async () => {
+    runs = [baseRun({ id: 42, status: 'completed', outcome: 'completed' })]
+
+    renderPage()
+
+    await screen.findByRole('heading', { name: 'Example task' })
+    expect(screen.getByText('#42')).toBeTruthy()
+    // status === outcome here, so the outcome badge is not duplicated —
+    // exactly one 'completed' badge renders.
+    expect(screen.getAllByText('completed')).toHaveLength(1)
+  })
+
+  it('renders status and outcome as two distinct badges when they differ', async () => {
+    runs = [baseRun({ id: 7, status: 'crashed', outcome: 'gave_up' })]
+
+    renderPage()
+
+    await screen.findByRole('heading', { name: 'Example task' })
+    expect(screen.getByText('#7')).toBeTruthy()
+    expect(screen.getByText('crashed')).toBeTruthy()
+    expect(screen.getByText('gave_up')).toBeTruthy()
+  })
+
+  it('renders BOTH summary and error when a failed run carries both', async () => {
+    runs = [
+      baseRun({
+        id: 3,
+        status: 'crashed',
+        outcome: 'crashed',
+        summary: 'status changed to crashed (dashboard/direct)',
+        error: 'worker exited with code 1'
+      })
+    ]
+
+    renderPage()
+
+    await screen.findByRole('heading', { name: 'Example task' })
+    expect(screen.getByText('status changed to crashed (dashboard/direct)')).toBeTruthy()
+    expect(screen.getByText('worker exited with code 1')).toBeTruthy()
   })
 })
 

@@ -23,7 +23,6 @@
 import {
   Badge,
   Button,
-  cn,
   Codicon,
   ErrorState,
   host,
@@ -102,13 +101,24 @@ function useProfileSessionIndex(profile: string) {
 function RunRow({ openId, profile, run }: { openId?: string; profile: string; run: KanbanProfileRun }) {
   const k = useKanban()
   const failed = FAILED_OUTCOMES.has(run.outcome ?? run.status)
+  // Status and outcome are distinct lifecycle fields (a 'running' status has
+  // no outcome yet; a terminal status like 'crashed' carries an outcome that
+  // can differ from the raw status column) — show both when they diverge
+  // instead of collapsing one into the other.
+  const showOutcome = Boolean(run.outcome) && run.outcome !== run.status
 
   return (
     <li className="flex flex-col gap-1 rounded-md border border-(--ui-stroke-secondary) p-2.5 text-[0.75rem]">
       <div className="flex flex-wrap items-center gap-2">
+        <span className="shrink-0 font-mono text-[0.65rem] text-(--ui-text-quaternary)">#{run.id}</span>
         <Badge size="xs" variant={failed ? 'destructive' : 'muted'}>
-          {run.outcome ?? run.status}
+          {run.status}
         </Badge>
+        {showOutcome && (
+          <Badge size="xs" variant={failed ? 'destructive' : 'muted'}>
+            {run.outcome}
+          </Badge>
+        )}
         {duration(run.started_at, run.ended_at) && (
           <span className="text-(--ui-text-quaternary)">{duration(run.started_at, run.ended_at)}</span>
         )}
@@ -125,16 +135,10 @@ function RunRow({ openId, profile, run }: { openId?: string; profile: string; ru
           </Button>
         ) : null}
       </div>
-      {(run.error || run.summary) && (
-        <p
-          className={cn(
-            'line-clamp-3 whitespace-pre-wrap',
-            run.error ? 'text-destructive' : 'text-(--ui-text-tertiary)'
-          )}
-        >
-          {run.error ?? run.summary}
-        </p>
+      {run.summary && (
+        <p className="line-clamp-3 whitespace-pre-wrap text-(--ui-text-tertiary)">{run.summary}</p>
       )}
+      {run.error && <p className="line-clamp-3 whitespace-pre-wrap text-destructive">{run.error}</p>}
     </li>
   )
 }
