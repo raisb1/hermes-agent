@@ -288,6 +288,7 @@ def test_write_pool_never_merges_cooldown_onto_reauthed_entry(classic_env):
     persisted = data["credential_pool"]["openrouter"][0]
     assert persisted["access_token"] == "sk-new"
     assert persisted.get("last_status") != "exhausted"
+    assert persisted.get("last_error_code") is None
 
 
 # ---------------------------------------------------------------------------
