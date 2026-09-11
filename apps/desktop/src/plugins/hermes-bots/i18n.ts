@@ -109,6 +109,10 @@ type BotsMessages = {
     openBotChat: string
     duplicate: string
     duplicateFailed: string
+    /** Context-menu link to the kanban plugin's read-only Task History view,
+     *  scoped to this bot's profile (navigation only, never a Bot Mode
+     *  session interaction). */
+    taskHistory: string
     deleteTitle: string
     removeFromAllGroups: string
     createFirstHint: string
@@ -339,6 +343,7 @@ const en: BotsMessages = {
     openBotChat: 'Open Bot Chat',
     duplicate: 'Duplicate',
     duplicateFailed: 'Duplicate failed',
+    taskHistory: 'Task History',
     deleteTitle: 'Delete bot and profile?',
     removeFromAllGroups: 'Remove from all groups',
     createFirstHint: 'Open the Bots pane and hit “New Bot”.',
@@ -558,6 +563,7 @@ const ja: BotsMessages = {
     openBotChat: 'ボットチャットを開く',
     duplicate: '複製',
     duplicateFailed: '複製に失敗しました',
+    taskHistory: 'タスク履歴',
     deleteTitle: 'ボットとプロファイルを削除しますか？',
     removeFromAllGroups: 'すべてのグループから外す',
     createFirstHint: 'ボットパネルを開いて「新しいボット」を押してください。',
@@ -773,6 +779,7 @@ const zh: BotsMessages = {
     openBotChat: '打开机器人聊天',
     duplicate: '复制',
     duplicateFailed: '复制失败',
+    taskHistory: '任务历史',
     deleteTitle: '删除机器人和配置档案？',
     removeFromAllGroups: '从所有群组中移除',
     createFirstHint: '打开机器人面板，点击“新建机器人”。',
@@ -987,6 +994,7 @@ const zhHant: BotsMessages = {
     openBotChat: '開啟機器人聊天',
     duplicate: '複製',
     duplicateFailed: '複製失敗',
+    taskHistory: '任務歷史',
     deleteTitle: '刪除機器人和設定檔？',
     removeFromAllGroups: '從所有群組中移除',
     createFirstHint: '開啟機器人面板，點「新增機器人」。',

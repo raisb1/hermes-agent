@@ -35,7 +35,7 @@ from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_diagnostics as kd
-from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _safe_attachment_name
+from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _json_or, _row_get, _safe_attachment_name
 
 log = logging.getLogger(__name__)
 
@@ -1530,6 +1530,39 @@ def auto_describe_profile(profile_name: str, payload: DescribeAutoBody):
         from hermes_cli import profile_describer
         outcome = profile_describer.describe_profile(profile_name, overwrite=bool(payload.overwrite))
     return {"ok": bool(outcome.ok), "profile": outcome.profile_name, "reason": outcome.reason, "description": outcome.description}
+
+
+# --- Task History (read-only per-profile run history) -------------------------
+# Feeds the desktop's Task History view: every task_runs row a profile ever
+# produced, most recent first, joined with the owning task's title/status so
+# the client can group rows by task id without a second round-trip per row.
+# LEFT JOIN so a run survives even if its task was later hard-deleted (title/
+# status come back null in that rare case rather than dropping the row).
+
+_PROFILE_RUNS_LIMIT = 200
+
+
+@router.get("/profiles/{profile_name}/runs")
+def list_profile_runs(profile_name: str, board: Optional[str] = Query(None)):
+    """Read-only run history for one profile — GET only, no mutation surface."""
+    with _board_conn(board) as (board, conn):
+        rows = conn.execute(
+            "SELECT r.*, t.title AS task_title, t.status AS task_status "
+            "FROM task_runs r LEFT JOIN tasks t ON t.id = r.task_id "
+            "WHERE r.profile = ? ORDER BY r.started_at DESC, r.id DESC LIMIT ?",
+            (profile_name, _PROFILE_RUNS_LIMIT),
+        ).fetchall()
+        return {"runs": [
+            {
+                "id": row["id"], "task_id": row["task_id"], "task_title": row["task_title"],
+                "task_status": row["task_status"], "profile": row["profile"], "status": row["status"],
+                "outcome": row["outcome"], "summary": row["summary"], "error": row["error"],
+                "metadata": _json_or(row["metadata"]), "worker_pid": row["worker_pid"],
+                "started_at": row["started_at"], "ended_at": row["ended_at"],
+                "worker_session_id": _row_get(row, "worker_session_id"),
+            }
+            for row in rows
+        ]}
 
 
 # --- Decompose (built-in decomposer fan-out) ----------------------------------
