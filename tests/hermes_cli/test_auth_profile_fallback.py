@@ -11,6 +11,7 @@ authenticated only at the global root.
 
 from __future__ import annotations
 
+import base64
 import json
 import time
 from contextlib import contextmanager
@@ -287,4 +288,75 @@ def test_write_pool_never_merges_cooldown_onto_reauthed_entry(classic_env):
     persisted = data["credential_pool"]["openrouter"][0]
     assert persisted["access_token"] == "sk-new"
     assert persisted.get("last_status") != "exhausted"
-    assert persisted.get("last_error_code") is None
+
+
+# ---------------------------------------------------------------------------
+# openai-codex rate-limit surfacing through the global-root borrow fallback
+#
+# Regression for t_8a10877a: a named profile with ZERO local openai-codex
+# rows legitimately "borrows" the singleton/pool grant seeded at the global
+# root (the same shadowing read_credential_pool() applies everywhere else).
+# _read_codex_pool_entries() used a bare _load_auth_store() + local-only
+# _pool_entries() lookup that skipped this fallback entirely, so a
+# rate-limited-but-PRESENT credential parked only at the global root was
+# invisible to resolve_codex_runtime_credentials()'s pool-rate-limit check
+# and fell through to _NO_CREDENTIALS_MSG ("No Codex credentials stored"),
+# never surfacing CODEX_RATE_LIMITED_CODE.
+# ---------------------------------------------------------------------------
+
+
+def _codex_jwt(email: str) -> str:
+    header = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').rstrip(b"=").decode()
+    payload = base64.urlsafe_b64encode(json.dumps({"email": email}).encode()).rstrip(b"=").decode()
+    return f"{header}.{payload}.signature"
+
+
+def test_codex_runtime_rate_limit_visible_through_global_root_borrow(profile_env):
+    """A profile borrowing a rate-limited-but-present global-root Codex credential must
+    raise CODEX_RATE_LIMITED_CODE (not misreport 'No Codex credentials stored')."""
+    from hermes_cli.auth import AuthError, CODEX_RATE_LIMITED_CODE, resolve_codex_runtime_credentials
+
+    entry = {
+        "id": "codex-1",
+        "label": "codex@example.com",
+        "auth_type": "oauth",
+        "priority": 0,
+        "source": "manual:device_code",
+        "access_token": _codex_jwt("codex@example.com"),
+        "refresh_token": "refresh-token",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "last_refresh": "2026-06-15T10:00:00Z",
+        "last_status": "exhausted",
+        "last_status_at": time.time(),
+        "last_error_code": 429,
+        "last_error_reason": "usage_limit_reached",
+        "last_error_message": "The usage limit has been reached",
+        "last_error_reset_at": time.time() + 3600,
+    }
+    # Global root OWNS the credential; the profile has NO local openai-codex rows at all
+    # (borrows via read_credential_pool's per-provider fallback).
+    _write(profile_env["global"] / "auth.json", _make_auth_store(
+        pool={"openai-codex": [entry]}, providers={}))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}, providers={}))
+
+    with pytest.raises(AuthError) as exc_info:
+        resolve_codex_runtime_credentials()
+
+    assert exc_info.value.code == CODEX_RATE_LIMITED_CODE
+    assert exc_info.value.relogin_required is False
+    assert "No Codex credentials stored" not in str(exc_info.value)
+
+
+def test_codex_runtime_absent_credential_unchanged_through_global_root(profile_env):
+    """Sanity: with NEITHER profile nor global root holding an openai-codex credential,
+    resolution still raises the plain 'missing' error (not rate_limit)."""
+    from hermes_cli.auth import AuthError, CODEX_RATE_LIMITED_CODE, resolve_codex_runtime_credentials
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={}, providers={}))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}, providers={}))
+
+    with pytest.raises(AuthError) as exc_info:
+        resolve_codex_runtime_credentials()
+
+    assert exc_info.value.code != CODEX_RATE_LIMITED_CODE
+    assert exc_info.value.relogin_required is True
