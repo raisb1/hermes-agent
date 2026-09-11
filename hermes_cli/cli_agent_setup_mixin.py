@@ -176,9 +176,18 @@ class CLIAgentSetupMixin:
 
     def _ensure_runtime_credentials(self) -> bool:
         """Re-resolve provider credentials before agent use so key rotation / token
-        refresh are picked up without restarting the CLI. False on auth failure."""
+        refresh are picked up without restarting the CLI. False on auth failure.
+
+        Sets ``self._last_credential_failure_reason`` to ``"rate_limit"`` when the
+        failure was a rate-limited-but-present OAuth credential (never re-auth-able),
+        else clears it. The kanban worker CLI path reads this to distinguish a quota
+        cooldown (park under ``rate_limit_cooldown``, exit 75) from a genuinely absent
+        credential (unchanged behavior) — see cli.py's single-query entry points.
+        """
         from cli import ChatConsole, logger
+        from hermes_cli.auth import is_rate_limited_auth_error
         from hermes_cli.runtime_provider import resolve_runtime_provider, format_runtime_provider_error
+        self._last_credential_failure_reason = None
         _primary_exc = None
         runtime = None
         try:
@@ -193,6 +202,8 @@ class CLIAgentSetupMixin:
                 _primary_exc = None
         if runtime is None:
             message = format_runtime_provider_error(_primary_exc) if _primary_exc else "Provider resolution failed."
+            if _primary_exc is not None and is_rate_limited_auth_error(_primary_exc):
+                self._last_credential_failure_reason = "rate_limit"
             ChatConsole().print(f"[bold red]{message}[/]")
             return False
         api_key = runtime.get("api_key")

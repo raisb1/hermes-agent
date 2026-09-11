@@ -69,6 +69,22 @@ export interface KanbanRun {
   worker_pid?: null | number
   started_at?: null | number
   ended_at?: null | number
+  /** Runtime id of the worker's own Hermes session (HERMES_SESSION_ID),
+   *  populated at heartbeat/complete/review time. Null until the worker's
+   *  first heartbeat lands (or if it crashed before one) — the join key
+   *  into `session.list` for "open this run's transcript". */
+  worker_session_id?: null | string
+}
+
+/** One `task_runs` row from `GET /profiles/:name/runs` — the desktop's Task
+ *  History view. A superset of `KanbanRun` carrying the run's OWN task id
+ *  plus a denormalized title/status (LEFT JOIN — null if the task was later
+ *  hard-deleted) so the client can group rows by task without a per-row
+ *  round trip. */
+export interface KanbanProfileRun extends KanbanRun {
+  task_id: string
+  task_title?: null | string
+  task_status?: null | string
 }
 
 export interface KanbanComment {

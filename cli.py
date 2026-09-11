@@ -4381,6 +4381,24 @@ def _configure_quiet_agent(agent) -> None:
     agent.tool_progress_mode = "off"
 
 
+def _credential_failure_exit_code(cli, default: int) -> int:
+    """Exit code for a failed single-query credential/agent-init resolution.
+
+    A kanban worker whose provider credential is rate-limited-but-PRESENT (surfaced by
+    ``_ensure_runtime_credentials`` setting ``cli._last_credential_failure_reason ==
+    "rate_limit"``) must exit ``KANBAN_RATE_LIMIT_EXIT_CODE`` so ``_classify_worker_exit``
+    parks the task under the existing ``rate_limit_cooldown`` guard instead of burning the
+    protocol-violation budget on a message that isn't actually "no credentials". A genuinely
+    absent/misconfigured credential is NOT rate_limit and falls through to *default*
+    unchanged — folding "missing" into 75 would silently park-and-retry forever.
+    """
+    if (os.environ.get("HERMES_KANBAN_TASK")
+            and getattr(cli, "_last_credential_failure_reason", None) == "rate_limit"):
+        from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+        return KANBAN_RATE_LIMIT_EXIT_CODE
+    return default
+
+
 def _run_single_query_mode(cli, query, image, quiet, oneshot):
     """``-q``/``--image`` entry: seed an interactive session on a TTY, else run the one-shot turn and exit."""
     if _should_seed_interactive(query, image, quiet, oneshot):
@@ -4424,14 +4442,26 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot):
                     _configure_quiet_agent(cli.agent)
                     _run_quiet_single_query(cli, effective_query)
 
-            sys.exit(1)  # credentials or agent init failed
+            sys.exit(_credential_failure_exit_code(cli, 1))  # credentials or agent init failed
         # No welcome banner (~420 ms cold); session id / resume hint come from _print_exit_summary().
         _query_label = query or ("[image attached]" if single_query_images else "")
         if _query_label:
             cli.console.print(f"[bold blue]Query:[/] {_query_label}")
         cli._show_security_advisories()
-        cli.chat(query, images=single_query_images or None)
+        response = cli.chat(query, images=single_query_images or None)
         cli._print_exit_summary(clear_screen=False)
+        # A kanban worker (no TTY, so it never seeded interactive above) whose provider
+        # credential is rate-limited-but-PRESENT fails inside chat() (returns None) without
+        # ever reaching cli.py's ~4088 failure_reason exit-code translation (that only fires
+        # for the -Q/quiet branch): pre-fix this fell through to Python's normal exit 0, a
+        # "clean_exit"/protocol-violation misclassification that bypasses rate_limit_cooldown
+        # entirely (see _credential_failure_exit_code). Only a recorded rate_limit failure is
+        # translated to 75 here — a genuinely absent/misconfigured credential keeps the
+        # original clean-fallthrough behavior (no sys.exit call, process exits 0).
+        if (response is None and os.environ.get("HERMES_KANBAN_TASK")
+                and getattr(cli, "_last_credential_failure_reason", None) == "rate_limit"):
+            from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+            sys.exit(KANBAN_RATE_LIMIT_EXIT_CODE)
     finally:
         _finalize_single_query(cli)
 
