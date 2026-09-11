@@ -32,8 +32,8 @@ def _call(method: str, params: dict) -> dict:
     return srv._methods[method](1, params)
 
 
-def _seed(db, sid: str) -> None:
-    db.create_session(sid, source="desktop")
+def _seed(db, sid: str, *, source: str = "desktop") -> None:
+    db.create_session(sid, source=source)
     db._conn.execute("UPDATE sessions SET message_count = 1 WHERE id = ?", (sid,))
     db._conn.commit()
 
@@ -69,3 +69,41 @@ def test_session_list_include_hidden(db):
 
     all_rows = _call("session.list", {"include_hidden": True})["result"]["sessions"]
     assert {s["id"] for s in all_rows} == {"plain-chat", "bot-chat"}
+
+
+def test_session_list_default_keeps_kanban_rows_hidden_from_human_listing(db):
+    _seed(db, "desktop-chat")
+    _seed(db, "kanban-worker", source="kanban")
+
+    rows = _call("session.list", {})["result"]["sessions"]
+
+    assert {row["id"] for row in rows} == {"desktop-chat"}
+    assert set(rows[0]) == {"id", "title", "preview", "started_at", "message_count", "source"}
+    assert rows[0]["source"] == "desktop"
+
+
+def test_session_list_sources_opt_in_returns_only_requested_denied_source(db):
+    _seed(db, "desktop-chat")
+    _seed(db, "kanban-worker", source="kanban")
+    _seed(db, "tool-worker", source="tool")
+
+    rows = _call("session.list", {"sources": ["kanban"]})["result"]["sessions"]
+
+    assert {row["id"] for row in rows} == {"kanban-worker"}
+
+
+def test_session_list_sources_accepts_a_single_string(db):
+    _seed(db, "kanban-worker", source="kanban")
+
+    rows = _call("session.list", {"sources": "kanban"})["result"]["sessions"]
+
+    assert {row["id"] for row in rows} == {"kanban-worker"}
+
+
+def test_session_list_sources_combines_with_include_hidden(db):
+    _seed(db, "kanban-worker", source="kanban")
+    assert db.set_session_hidden("kanban-worker", True) is True
+
+    rows = _call("session.list", {"sources": ["kanban"], "include_hidden": True})["result"]["sessions"]
+
+    assert {row["id"] for row in rows} == {"kanban-worker"}

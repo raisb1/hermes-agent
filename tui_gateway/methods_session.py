@@ -134,14 +134,27 @@ def _session_row_summary(row: dict, *, tip_row: dict | None = None, resolved_id=
 _LISTING_DENY_SOURCES = frozenset({"kanban", "tool"})
 
 
-def _denied_source(row: dict) -> bool:
-    return (row.get("source") or "").strip().lower() in _LISTING_DENY_SOURCES
+def _denied_source(row: dict, allowed: frozenset = frozenset()) -> bool:
+    source = (row.get("source") or "").strip().lower()
+    return source not in allowed and source in _LISTING_DENY_SOURCES
 
 
-def _listing_rows(db, limit: int, **kwargs) -> list:
-    """Human-facing ``list_sessions_rich`` rows (most recent first), deny-list applied."""
-    rows = db.list_sessions_rich(source=None, limit=limit, order_by_last_active=True, compact_rows=True, **kwargs)
-    return [row for row in rows if not _denied_source(row)]
+def _listing_rows(db, limit: int, *, sources=None, **kwargs) -> list:
+    """Human-facing ``list_sessions_rich`` rows; explicit sources opt into matching denied sources."""
+    rows = db.list_sessions_rich(
+        source=None, sources=sources, limit=limit, order_by_last_active=True, compact_rows=True, **kwargs)
+    allowed = frozenset(source.strip().lower() for source in (sources or []) if source)
+    return [row for row in rows if not _denied_source(row, allowed)]
+
+
+def _list_param(params: dict, key: str) -> list[str] | None:
+    """A JSON-RPC list param, tolerant of a single string or an empty/absent value."""
+    value = params.get(key)
+    if not value:
+        return None
+    if isinstance(value, str):
+        return [value] if value.strip() else None
+    return [str(item).strip() for item in value if str(item).strip()] or None
 
 
 def _snapshot_sessions(rid):
@@ -429,9 +442,11 @@ def _(rid, params: dict, db) -> dict:
         if title_lookup := _str_param(params, "title"):
             return _session_list_by_title(rid, db, title_lookup)
         limit = int(params.get("limit", 200) or 200)
+        sources_param = _list_param(params, "sources")
         # Over-fetch: per-source filtering + tip merging must not leave us short. ``include_hidden`` is for
         # surfaces that OWN hidden sessions (Bots pane, pickers).
-        rows = _listing_rows(db, max(limit * 2, 200), include_hidden=_flag(params, "include_hidden"))[:limit]
+        rows = _listing_rows(
+            db, max(limit * 2, 200), include_hidden=_flag(params, "include_hidden"), sources=sources_param)[:limit]
         return _ok(rid, {"sessions": [_session_row_summary(s) for s in rows]})
     except Exception as e:
         return _err(rid, 5006, str(e))

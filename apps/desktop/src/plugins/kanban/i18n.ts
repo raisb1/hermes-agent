@@ -209,6 +209,14 @@ type KanbanMessages = {
     openKanban: string
     artifacts: (n: number) => string
   }
+  // Task History (read-only per-profile run log)
+  historyTitle: string
+  historyPickProfile: string
+  historyEmpty: string
+  historyRunsFor: (profile: string) => string
+  historyOpenTranscript: string
+  historyMenuLabel: string
+  historyCommand: string
 }
 
 export const en: KanbanMessages = {
@@ -420,7 +428,14 @@ export const en: KanbanMessages = {
     timedOutTitle: 'Task timed out — will retry',
     openKanban: 'Open Kanban',
     artifacts: (n: number) => `${n} artifacts`
-  }
+  },
+  historyTitle: 'Task History',
+  historyPickProfile: 'Pick a profile',
+  historyEmpty: 'No runs yet for this profile.',
+  historyRunsFor: profile => `Runs — ${profile}`,
+  historyOpenTranscript: 'Open transcript',
+  historyMenuLabel: 'Task History',
+  historyCommand: 'Kanban: Task History'
 }
 
 const ja: KanbanMessages = {
@@ -631,7 +646,14 @@ const ja: KanbanMessages = {
     timedOutTitle: 'タスクがタイムアウト — 再試行します',
     openKanban: 'かんばんを開く',
     artifacts: (n: number) => `成果物 ${n} 件`
-  }
+  },
+  historyTitle: 'タスク履歴',
+  historyPickProfile: 'プロフィールを選択',
+  historyEmpty: 'このプロフィールの実行履歴はまだありません。',
+  historyRunsFor: profile => `実行履歴 — ${profile}`,
+  historyOpenTranscript: 'トランスクリプトを開く',
+  historyMenuLabel: 'タスク履歴',
+  historyCommand: 'カンバン: タスク履歴'
 }
 
 const zh: KanbanMessages = {
@@ -839,7 +861,14 @@ const zh: KanbanMessages = {
     timedOutTitle: '任务超时 — 将重试',
     openKanban: '打开看板',
     artifacts: (n: number) => `${n} 个产物`
-  }
+  },
+  historyTitle: '任务历史',
+  historyPickProfile: '选择配置档',
+  historyEmpty: '此配置档暂无运行记录。',
+  historyRunsFor: profile => `运行记录 — ${profile}`,
+  historyOpenTranscript: '打开对话记录',
+  historyMenuLabel: '任务历史',
+  historyCommand: '看板：任务历史'
 }
 
 const zhHant: KanbanMessages = {
@@ -1047,7 +1076,14 @@ const zhHant: KanbanMessages = {
     timedOutTitle: '任務逾時 — 將重試',
     openKanban: '開啟看板',
     artifacts: (n: number) => `${n} 個產物`
-  }
+  },
+  historyTitle: '任務歷史',
+  historyPickProfile: '選擇設定檔',
+  historyEmpty: '此設定檔尚無執行記錄。',
+  historyRunsFor: profile => `執行記錄 — ${profile}`,
+  historyOpenTranscript: '開啟對話記錄',
+  historyMenuLabel: '任務歷史',
+  historyCommand: '看板：任務歷史'
 }
 
 /** Registered via `ctx.i18n.register` at plugin load (disposer tracked). */

@@ -827,6 +827,14 @@ _NOTIFY_SUB_COLUMNS = (
     ("delivery_metadata", "delivery_metadata TEXT"),
 )
 
+# ``task_runs`` has never needed a post-v1 additive column before; a single
+# small tuple (mirroring ``_LATER_TASK_COLUMNS``'s idiom) is enough until it
+# does again.
+_TASK_RUN_OPTIONAL_COLUMNS = (
+    ("worker_session_id", "worker_session_id TEXT"),
+)
+
+
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -901,6 +909,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 )
 
     if _table_exists(conn, "task_runs"):
+        run_cols = _column_names(conn, "task_runs")
+        for name, ddl in _TASK_RUN_OPTIONAL_COLUMNS:
+            if name not in run_cols:
+                _add_column_if_missing(conn, "task_runs", name, ddl)
         _backfill_legacy_inflight_runs(conn)
 
     # One-shot event-kind rename: old names still worked but were awkward on
