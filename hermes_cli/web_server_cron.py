@@ -79,6 +79,23 @@ def _validate_dashboard_cron_context_from(refs: Optional[List[str]], profile_nam
                 detail=f"context_from job '{ref}' not found in profile '{profile_name}'")
 
 
+def _default_multiplex_profile_allowlist() -> "list[str] | None":
+    """``gateway.multiplex_profile_allowlist`` as the DEFAULT profile's config declares it (the
+    multiplexer's served set), so the Desktop ticker mirrors ``gateway/run.py::_multiplex_profile_homes``
+    instead of ticking every installed profile. ``None`` = serve all (historical behavior)."""
+    from gateway.config import _normalize_multiplex_profile_allowlist
+    from hermes_cli.config import read_user_config_raw
+    from hermes_constants import get_default_hermes_root
+
+    cfg_path = get_default_hermes_root() / "config.yaml"
+    if not cfg_path.exists():
+        return None
+    cfg = read_user_config_raw(cfg_path) or {}
+    raw = cfg.get("multiplex_profile_allowlist") if "multiplex_profile_allowlist" in cfg else (
+        cfg.get("gateway") or {}).get("multiplex_profile_allowlist")
+    return _normalize_multiplex_profile_allowlist(raw)
+
+
 def _cron_profile_dicts() -> List[Dict[str, Any]]:
     """Minimal profile records (callers only consume ``name``); avoids ``list_profiles()``,
     whose config parsing, gateway probes and skill counts are GIL pressure on large pools."""
@@ -278,7 +295,7 @@ def _fire_cron_job_for_profile(profile: str, job_id: str, *, force: bool = False
     and external callers on the web_deps late-binding seam; do not add new uses.
     """
     _profile_name, home = _cron_profile_home(profile)
-    from cron.scheduler_provider import provider_supports_force_fire, resolve_cron_scheduler
+    from cron.scheduler_provider import provider_fire_due_accepts, provider_supports_force_fire, resolve_cron_scheduler
     with _cron_store_scope(home):
         provider = resolve_cron_scheduler()
         if force:
@@ -289,6 +306,10 @@ def _fire_cron_job_for_profile(profile: str, job_id: str, *, force: bool = False
                         f"Cron provider '{getattr(provider, 'name', 'custom')}' "
                         "does not support atomic forced firing of paused jobs"))
             return bool(provider.fire_due(job_id, adapters=None, loop=None, force=True))
+        # Off-tick run-now: never stamp next_run_at as the occurrence (#104790); third-party
+        # providers without the kwarg keep the legacy call.
+        if provider_fire_due_accepts(provider, "manual"):
+            return bool(provider.fire_due(job_id, adapters=None, loop=None, manual=True))
         return bool(provider.fire_due(job_id, adapters=None, loop=None))
 
 
