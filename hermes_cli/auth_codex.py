@@ -578,11 +578,21 @@ def _codex_pool_dicts(entries: Optional[List[Any]]) -> Iterator[Dict[str, Any]]:
 
 
 def _read_codex_pool_entries() -> Optional[List[Any]]:
-    """Locked read of ``credential_pool.openai-codex`` from auth.json (None when absent)."""
-    from hermes_cli.auth import _auth_store_lock, _load_auth_store
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-    return _pool_entries(auth_store, "openai-codex")
+    """Read ``credential_pool.openai-codex`` rows, including the global-root fallback.
+
+    Must use ``read_credential_pool`` (not a bare ``_load_auth_store`` + ``_pool_entries``
+    local-only read): a profile whose own auth.json has zero openai-codex rows legitimately
+    "borrows" the singleton/pool grant seeded at the global root (``_profile_owns_pool_provider``
+    is False), the same way ``hermes auth list`` / ``get_codex_auth_status`` sees it. Without the
+    fallback here, a kanban worker profile with a rate-limited-but-present global-root credential
+    got neither a pool token NOR a pool-rate-limit hit from this helper, so
+    ``resolve_codex_runtime_credentials`` fell through to ``_NO_CREDENTIALS_MSG`` — misreporting
+    a live 429 cooldown as an absent credential (never surfaces ``CODEX_RATE_LIMITED_CODE``, so the
+    kanban worker CLI path exits 0 instead of ``KANBAN_RATE_LIMIT_EXIT_CODE``/75).
+    """
+    from hermes_cli.auth import read_credential_pool
+    entries = read_credential_pool("openai-codex")  # provider_id set -> always a list
+    return entries or None  # type: ignore[return-value]
 
 
 def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
