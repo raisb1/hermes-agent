@@ -144,6 +144,41 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
+# Live ``Popen`` handles for workers this process spawned, keyed by pid. A Popen
+# whose object is dropped without ``wait()`` is parked by CPython in
+# ``subprocess._active`` and silently reaped by the NEXT ``Popen`` anywhere in
+# the process (``subprocess._cleanup``) — a cron script, a ``ps`` probe in
+# ``_pid_alive`` — so by the time ``reap_worker_zombies`` runs ``waitpid(-1)``
+# there is no child left and the exit status (including the rate-limit
+# sentinel 75) is lost: the worker is classified ``unknown`` and the task takes
+# a crash strike for a quota wall. Holding the handle keeps the child out of
+# ``_active``; ``reap_worker_zombies`` polls these first so the status is ours.
+_live_worker_procs: "dict[int, subprocess.Popen]" = {}
+
+
+def _register_worker_proc(proc: "subprocess.Popen") -> None:
+    if proc.pid and proc.pid > 0:
+        _live_worker_procs[int(proc.pid)] = proc
+
+
+def _reap_registered_workers() -> "list[int]":
+    """Reap exited workers via their retained handles; record real exit codes."""
+    reaped: "list[int]" = []
+    for pid, proc in list(_live_worker_procs.items()):
+        try:
+            rc = proc.poll()
+        except Exception:
+            rc = None
+        if rc is None:
+            continue
+        _live_worker_procs.pop(pid, None)
+        # Reconstruct a raw wait status so _classify_worker_exit's
+        # WIFEXITED/WIFSIGNALED path is unchanged: negative rc == signal.
+        raw = (-rc) if rc < 0 else (rc << 8)
+        _record_worker_exit(pid, raw)
+        reaped.append(pid)
+    return reaped
+
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped child's exit status; duplicate pids overwrite (latest wins)."""
@@ -188,8 +223,13 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
 
 
 def reap_worker_zombies() -> "list[int]":
-    """Reap all zombie children without blocking; returns reaped PIDs. No-op on Windows."""
-    reaped: "list[int]" = []
+    """Reap all zombie children without blocking; returns reaped PIDs. No-op on Windows.
+
+    Workers spawned by this process are reaped through their retained ``Popen``
+    handles first (real exit status, see ``_live_worker_procs``); the
+    ``waitpid(-1)`` sweep then covers anything else.
+    """
+    reaped: "list[int]" = _reap_registered_workers()
     if os.name != "nt":
         try:
             while True:
@@ -199,6 +239,7 @@ def reap_worker_zombies() -> "list[int]":
                     break
                 if pid == 0:
                     break
+                _live_worker_procs.pop(pid, None)
                 _record_worker_exit(pid, status)
                 reaped.append(pid)
         except Exception:
@@ -2298,6 +2339,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         )
     # Intentionally NOT closing log_f: the child keeps writing after return;
     # the OS-level FD stays open in the child until it exits.
+    _register_worker_proc(proc)
     return proc.pid
 
 

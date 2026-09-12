@@ -1730,6 +1730,42 @@ def test_write_txn_check_reads_correct_header_fields(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_worker_exit_status_survives_intervening_subprocess_calls(monkeypatch):
+    """A worker's real exit code must reach ``_classify_worker_exit`` even when
+    other ``subprocess`` calls run between its exit and the reap tick.
+
+    ``_spawn_worker`` keeps only the pid; CPython parks the dropped ``Popen`` in
+    ``subprocess._active`` and the next ``Popen`` anywhere in the process reaps
+    it silently, so ``waitpid(-1)`` then finds no child and the rate-limit
+    sentinel (75) degrades to ``unknown`` → a crash strike for a quota wall.
+    """
+    import gc
+    import subprocess
+    from hermes_cli import kanban_db_dispatch as _kbd
+    from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+
+    monkeypatch.setattr(_kbd, "_live_worker_procs", {})
+    monkeypatch.setattr(_kbd, "_recent_worker_exits", {})
+
+    def spawn_like_dispatcher() -> int:
+        proc = subprocess.Popen(["sh", "-c", f"exit {KANBAN_RATE_LIMIT_EXIT_CODE}"])
+        _kbd._register_worker_proc(proc)
+        return proc.pid  # Popen object dropped here, exactly like _spawn_worker
+
+    pid = spawn_like_dispatcher()
+    deadline = time.time() + 5
+    while _kbd._pid_alive(pid) and time.time() < deadline:
+        time.sleep(0.05)
+    gc.collect()
+    # Anything else the gateway does between ticks — a `ps` probe, a cron
+    # script — triggers subprocess._cleanup() on the orphaned handle.
+    subprocess.run(["true"], check=False)
+
+    assert pid in _kbd.reap_worker_zombies()
+    assert _kbd._classify_worker_exit(pid) == ("rate_limited", KANBAN_RATE_LIMIT_EXIT_CODE)
+    assert pid not in _kbd._live_worker_procs
+
+
 
 
 
