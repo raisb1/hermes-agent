@@ -8,7 +8,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban as kc
 from hermes_cli.kanban_db_connect import connect
+from hermes_cli.kanban_pr_acceptance import collect_acceptance
 
 
 @pytest.fixture
@@ -19,13 +21,18 @@ def github(tmp_path, monkeypatch):
         def do_GET(self):
             state["requests"].append(self.path)
             sha = state["head"]
+            status = 200
             if self.path == "/graphql":
                 value = {"data": {"repository": {"pullRequest": {
                     "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
-                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
-                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": ([] if state.get("no_required_checks") else [
+                        {"context": "required", "app": {"databaseId": 1}}])}}}}}}
             elif "/rules/branches/" in self.path:
-                value = [[]]
+                if state.get("rules_error"):
+                    status, message = state["rules_error"]
+                    value = {"message": message}
+                else:
+                    value = state.get("rules", [[]])
             elif "/check-runs" in self.path:
                 run = {"id": 42, "name": "required", "head_sha": sha,
                        "app": {"id": 1}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
@@ -47,7 +54,7 @@ def github(tmp_path, monkeypatch):
             else:
                 self.send_error(404)
                 return
-            self.send_response(200)
+            self.send_response(status)
             self.end_headers()
             self.wfile.write(json.dumps(value).encode())
 
@@ -60,9 +67,13 @@ def github(tmp_path, monkeypatch):
     shim = tmp_path / "bin"
     shim.mkdir()
     gh = shim / "gh"
-    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request\n"
+    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request,urllib.error\n"
                   f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
-                  "print(urllib.request.urlopen(u).read().decode())\n")
+                  "try:\n r=urllib.request.urlopen(u); status=r.status; body=r.read().decode()\n"
+                  "except urllib.error.HTTPError as e:\n status=e.code; body=e.read().decode()\n"
+                  "if '--include' in sys.argv: print(f'HTTP/1.1 {status} fixture\\n\\n'+body)\n"
+                  "elif status < 400: print(body)\n"
+                  "else: sys.stderr.write(body); sys.exit(1)\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -75,7 +86,6 @@ def github(tmp_path, monkeypatch):
         thread.join()
 
 
-@pytest.mark.linux_only
 def test_pr_completion_requires_current_required_evidence(github):
     with connect() as conn:
         for conclusion in ("failure", "pending", "cancelled", "timed_out", "action_required", "neutral", "skipped", None, "success"):
@@ -109,7 +119,6 @@ def test_pr_completion_requires_current_required_evidence(github):
         assert len(github["requests"]) == before
 
 
-@pytest.mark.linux_only
 def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
     with connect() as conn:
         for conclusion in ("success", "failure"):
@@ -129,3 +138,67 @@ def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
             assert kb.get_task(conn, tid).status != "done"
             assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0] == 0
             github.pop("race")
+
+
+def test_no_required_checks_needs_explicit_audited_local_policy(github):
+    """No configured CI never silently turns a PR task into local-only work."""
+    github["no_required_checks"] = True
+
+    strict = collect_acceptance(
+        "https://github.com/acme/repo/pull/7",
+        "https://github.com/acme/repo/pull/7",
+        policy="required-checks",
+    )
+    local = collect_acceptance(
+        "https://github.com/acme/repo/pull/7",
+        "https://github.com/acme/repo/pull/7",
+        policy="local-if-no-required-checks",
+    )
+
+    assert not strict["ok"]
+    assert strict["classification"] == "no-required-checks"
+    assert "set-pr-policy" in strict["recovery"]
+    assert local["ok"]
+    assert local["verification_source"] == "declared-local"
+
+
+@pytest.mark.parametrize("status,message,recognized", [
+    (403, "Upgrade to GitHub Pro or make this repository public to enable this feature.", True),
+    (403, "Resource not accessible by integration", False),
+    (401, "Upgrade to GitHub Pro or make this repository public to enable this feature.", False),
+])
+def test_only_exact_rules_plan_response_is_sanitized_as_unavailable(github, status, message, recognized):
+    github.update(no_required_checks=True, rules_error=(status, message))
+    receipt = collect_acceptance("https://github.com/acme/repo/pull/7",
+                                 "https://github.com/acme/repo/pull/7",
+                                 policy="required-checks")
+    if recognized:
+        assert receipt["classification"] == "no-required-checks"
+        assert receipt["ruleset_unavailable"] is True
+    else:
+        assert receipt["classification"] == "infra"
+
+
+def test_cli_policy_round_trip_keeps_blocked_exact_pr_identity(github):
+    """Operators can audit/revert policy without repurposing completion-contract editing."""
+    contract = "https://github.com/acme/repo/pull/7"
+    with connect() as conn:
+        tid = kb.create_task(conn, title="blocked publish", completion_contract=contract,
+                             initial_status="blocked")
+
+    assert "Set PR acceptance policy" in kc.run_slash(
+        f'set-pr-policy {tid} local-if-no-required-checks --reason "local test log is authoritative"')
+    shown = json.loads(kc.run_slash(f"show {tid} --json"))
+    assert shown["task"]["pr_acceptance_policy"] == "local-if-no-required-checks"
+    assert shown["task"]["completion_contract"] == contract
+    assert "Set PR acceptance policy" in kc.run_slash(
+        f'set-pr-policy {tid} required-checks --reason "restore CI requirement"')
+    with connect() as conn:
+        events = [json.loads(row[0]) for row in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance_policy_changed'", (tid,))]
+        task = kb.get_task(conn, tid)
+    assert [event["new_policy"] for event in events] == ["local-if-no-required-checks", "required-checks"]
+    assert all(event["author"] for event in events)
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.completion_contract == contract

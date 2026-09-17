@@ -20,7 +20,7 @@ _TASK_DICT_FIELDS = (
     "workspace_kind", "workspace_path", "branch_name", "project_id",
     "created_by", "created_at", "started_at", "completed_at", "result",
     "skills", "max_retries", "model_override", "provider_override",
-    "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
+    "session_id", "workflow_template_id", "current_step_key", "completion_contract", "pr_acceptance_policy", "last_failure_error",
 )
 _SHOW_RUN_FIELDS = (
     "id", "profile", "step_key", "status", "outcome", "summary", "error",
@@ -84,5 +84,10 @@ def _obj_dict(obj: Any, fields: tuple[str, ...]) -> dict[str, Any]:
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     d = _obj_dict(t, _TASK_DICT_FIELDS)
+    from hermes_cli.kanban_pr_acceptance import effective_policy
+    try:
+        d["pr_acceptance_policy"] = effective_policy(t.pr_acceptance_policy)
+    except ValueError:
+        d["pr_acceptance_policy"] = t.pr_acceptance_policy
     d["skills"] = list(t.skills) if t.skills else []
     return d
