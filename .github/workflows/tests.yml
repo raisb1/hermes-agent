@@ -13,12 +13,21 @@ concurrency:
 
 jobs:
   test:
-    name: Run tests
-    # The whole suite runs in one job; it is intentionally not sliced. The
-    # former sliced approach required a matrix job, duration cache, per-slice
-    # artifact, and merge job.
+    name: Run tests slice ${{ matrix.slice }}/16
+    # Standard hosted runners have four cores, so the full suite cannot use
+    # the 96-way process pool that was tuned for the retired larger runner.
+    # Each matrix entry discovers the same Linux suite, then the canonical
+    # runner deterministically selects its non-overlapping 1/16 slice. The
+    # reusable-workflow result remains failed when any matrix entry fails.
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      # Finish every slice so a failure report is complete; matrix failure
+      # still makes this reusable workflow, and therefore CI's required
+      # Python-tests gate, fail.
+      fail-fast: false
+      matrix:
+        slice: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -83,24 +92,22 @@ jobs:
         # re-download, keeping the persisted cache small and fast to restore.
         run: uv cache prune --ci
 
-      - name: Run tests
+      - name: Run tests (slice ${{ matrix.slice }}/16)
         # Per-file isolation via scripts/run_tests.sh: each test file runs
         # in its own freshly-spawned `python -m pytest <file>` subprocess
         # with bounded parallelism. No xdist, no shared workers, no
         # module-level state leakage between files.
         #
-        # No --files: the runner discovers the suite itself. The discovered
-        # set is identical to the list the removed matrix job used to pass in.
+        # The runner discovers the suite before applying HERMES_TEST_SLICE;
+        # every matrix job therefore partitions the same complete file list.
         run: |
           source .venv/bin/activate
           scripts/run_tests.sh
         env:
-          # This is the maximum number of test FILES that run together.
-          # run_tests_parallel.py starts one pytest subprocess per file from a
-          # single ThreadPoolExecutor, so this fixed value is the limit.
-          # Retain it during the standard-runner migration and monitor resource
-          # contention rather than treating it as a one-worker-per-core value.
-          HERMES_TEST_WORKERS: 96
+          # Four isolated pytest files at a time matches the standard
+          # runner's CPU capacity rather than oversubscribing it 24-fold.
+          HERMES_TEST_WORKERS: 4
+          HERMES_TEST_SLICE: ${{ matrix.slice }}/16
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
