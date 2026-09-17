@@ -37,6 +37,27 @@ def _wait_job(client, job_id: str, timeout: float = 10.0) -> dict:
     raise AssertionError(f"job {job_id} still running after {timeout}s")
 
 
+@pytest.fixture
+def automatic_recommendation(monkeypatch):
+    """A reviewed 24 GiB discrete budget with a real automatic recommendation.
+
+    Quickstart success tests own the HTTP/job/config seams, not host hardware
+    detection. Keep catalog recommendation and variant selection real while
+    making the hardware boundary deterministic.
+    """
+    from hermes_cli.local_runtime.estimator import HardwareBudget
+    import hermes_cli.web_routers.local_models as lm
+
+    gib = 1 << 30
+    budget = HardwareBudget(
+        usable_vram_bytes=22 * gib,
+        total_device_bytes=24 * gib,
+        ram_available_bytes=64 * gib,
+        uma=False,
+    )
+    monkeypatch.setattr(lm.hardware, "probe_budget", lambda **_kwargs: budget)
+
+
 def test_quickstart_unknown_model_404s(client):
     r = client.post("/api/local-models/quickstart", json={"model_id": "no-such"})
     assert r.status_code == 404
@@ -118,7 +139,7 @@ def test_quickstart_refuses_when_nothing_fits(client, monkeypatch):
     assert "Local Models" in r.json()["detail"]
 
 
-def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
+def test_quickstart_runs_all_three_legs(client, automatic_recommendation, monkeypatch, tmp_path):
     """Fresh machine: install runtime -> download recommended -> activate.
     Each leg is asserted by its observable call, in order."""
     calls: list[str] = []
@@ -179,7 +200,7 @@ def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
     assert load_config()["local_runtime"]["enabled"] is True
 
 
-def test_quickstart_skips_satisfied_legs(client, monkeypatch):
+def test_quickstart_skips_satisfied_legs(client, automatic_recommendation, monkeypatch):
     """Runtime present and model already staged: the response says so and
     the job goes straight to activation."""
     calls: list[str] = []
