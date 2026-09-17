@@ -98,16 +98,17 @@ jobs:
         # with bounded parallelism. No xdist, no shared workers, no
         # module-level state leakage between files.
         #
-        # The runner discovers the suite before applying HERMES_TEST_SLICE;
-        # every matrix job therefore partitions the same complete file list.
+        # The runner discovers the suite before applying this explicit slice
+        # flag, so every matrix job partitions the same complete file list.
+        # Do not set HERMES_TEST_SLICE in the environment: runner tests spawn
+        # child runners and must exercise their own unsliced invocation.
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh
+          scripts/run_tests.sh --slice '${{ matrix.slice }}/16'
         env:
           # Four isolated pytest files at a time matches the standard
           # runner's CPU capacity rather than oversubscribing it 24-fold.
           HERMES_TEST_WORKERS: 4
-          HERMES_TEST_SLICE: ${{ matrix.slice }}/16
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
