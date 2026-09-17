@@ -12,7 +12,7 @@ from urllib.parse import quote
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
-_HTTP_STATUS = re.compile(r"^HTTP/\S+ ([1-5][0-9]{2})\b")
+_HTTP_STATUS = re.compile(r"HTTP/\S+ ([1-5][0-9]{2})\b")
 _RULES_PLAN_MESSAGE = "Upgrade to GitHub Pro or make this repository public to enable this feature."
 REQUIRED_CHECKS_POLICY = "required-checks"
 LOCAL_IF_NO_REQUIRED_CHECKS_POLICY = "local-if-no-required-checks"
@@ -60,19 +60,43 @@ def _rules_api(endpoint: str):
     command = ["gh", "api", endpoint, "--hostname", "github.com", "--paginate", "--slurp", "--include"]
     result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
                             text=True, timeout=30, check=False)
-    headers, separator, body = result.stdout.replace("\r\n", "\n").partition("\n\n")
-    status_match = _HTTP_STATUS.match(headers)
-    if not separator or not status_match:
-        raise ValueError("GitHub rules response lacked structured HTTP evidence")
-    value = json.loads(body)
-    status = int(status_match.group(1))
-    if status == 403 and isinstance(value, dict) and value.get("message") == _RULES_PLAN_MESSAGE:
+    output = result.stdout.replace("\r\n", "\n")
+    if not output.startswith("["):
+        raise ValueError("GitHub rules response lacked gh slurp framing")
+    decoder = json.JSONDecoder()
+    packets: list[tuple[int, object]] = []
+    position = 1
+    while True:
+        status_match = _HTTP_STATUS.match(output, position)
+        separator = output.find("\n\n", position)
+        if not status_match or separator < 0:
+            raise ValueError("GitHub rules response lacked structured HTTP evidence")
+        try:
+            value, position = decoder.raw_decode(output, separator + 2)
+        except json.JSONDecodeError:
+            raise ValueError("GitHub rules response was malformed") from None
+        packets.append((int(status_match.group(1)), value))
+        while position < len(output) and output[position].isspace():
+            position += 1
+        if position < len(output) and output[position] == "]":
+            position += 1
+            while position < len(output) and output[position].isspace():
+                position += 1
+            if position == len(output):
+                break
+            raise ValueError("GitHub rules response had malformed gh slurp framing")
+        if position < len(output) and output[position] == ",":
+            position += 1
+        if position >= len(output) or not output.startswith("HTTP", position):
+            raise ValueError("GitHub rules response had malformed gh slurp framing")
+    if len(packets) == 1 and packets[0][0] == 403 and isinstance(packets[0][1], dict) and packets[0][1].get("message") == _RULES_PLAN_MESSAGE:
         return None
-    if result.returncode or status != 200:
+    if result.returncode or any(status != 200 for status, _ in packets):
         raise ValueError("GitHub rules endpoint failed")
-    if not isinstance(value, list):
+    pages = [value for _, value in packets]
+    if not all(isinstance(page, list) for page in pages):
         raise ValueError("GitHub rules response was malformed")
-    return value
+    return pages
 
 
 def _required_from_rules(pages: list) -> set[tuple[str, int | None]]:
@@ -133,11 +157,15 @@ def _current_pr_matches(current, sha: str, branch: str) -> bool:
         current_sha = current["head"]["sha"]
         current_branch = current["base"]["ref"]
         state = current["state"]
+        merged = current["merged"]
     except (KeyError, TypeError):
         raise ValueError("GitHub final PR response was malformed") from None
-    if not isinstance(current_sha, str) or not isinstance(current_branch, str) or not isinstance(state, str):
+    if (not isinstance(current_sha, str) or not isinstance(current_branch, str)
+            or state not in {"open", "closed"} or not isinstance(merged, bool)):
         raise ValueError("GitHub final PR response was malformed")
-    return current_sha == sha and current_branch == branch and not (state == "closed" and not current.get("merged"))
+    if state == "open" and merged:
+        raise ValueError("GitHub final PR response was malformed")
+    return current_sha == sha and current_branch == branch and (state == "open" or merged)
 
 
 def _check_pages(pages, sha: str) -> list[dict]:
