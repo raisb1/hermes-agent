@@ -25,10 +25,14 @@ def github(tmp_path, monkeypatch):
             status = 200
             headers = []
             if self.path == "/graphql":
-                value = state.get("graphql", {"data": {"repository": {"pullRequest": {
-                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
-                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": ([] if state.get("no_required_checks") else [
-                        {"context": "required", "app": {"databaseId": 1}}])}}}}}})
+                if error := state.get("graphql_error"):
+                    status, message = error
+                    value = {"message": message}
+                else:
+                    value = state.get("graphql", {"data": {"repository": {"pullRequest": {
+                        "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
+                        "baseRef": {"branchProtectionRule": {"requiredStatusChecks": ([] if state.get("no_required_checks") else [
+                            {"context": "required", "app": {"databaseId": 1}}])}}}}}})
             elif "/rules/branches/" in self.path:
                 if state.get("rules_error"):
                     status, message = state["rules_error"]
@@ -56,9 +60,13 @@ def github(tmp_path, monkeypatch):
             elif "/statuses" in self.path:
                 value = [[]]
             elif "/pulls/" in self.path:
-                value = state.get("current", {
-                    "head": {"sha": sha}, "base": {"ref": "main"}, "state": "open", "merged": False,
-                })
+                if error := state.get("pulls_error"):
+                    status, message = error
+                    value = {"message": message}
+                else:
+                    value = state.get("current", {
+                        "head": {"sha": sha}, "base": {"ref": "main"}, "state": "open", "merged": False,
+                    })
             else:
                 self.send_error(404)
                 return
@@ -168,37 +176,37 @@ def test_final_pr_state_requires_valid_rest_state_and_merge_evidence(github, sta
 
 
 @pytest.mark.parametrize("policy", ["required-checks", "local-if-no-required-checks"])
-def test_ruleset_requirements_stay_mandatory_under_both_policies(github, policy):
-    github.update(no_required_checks=True, conclusion="failure", rules_pages=[
-        [],
-        [{"type": "required_status_checks", "parameters": {
-            "required_status_checks": [{"context": "ruleset-required", "integration_id": 1}],
-        }}],
-    ])
+@pytest.mark.parametrize(("conclusion", "missing", "stale", "classification"), [
+    ("success", True, False, "missing"),
+    ("failure", False, False, "failure"),
+    ("pending", False, False, "pending"),
+    ("success", False, True, "stale"),
+    ("success", False, False, "success"),
+])
+def test_ruleset_requirements_remain_mandatory_under_both_policies(
+        github, policy, conclusion, missing, stale, classification):
+    """Ruleset checks cannot be bypassed by the explicit no-CI policy."""
+    github.update(no_required_checks=True, check_name="ruleset-required", conclusion=conclusion,
+                  missing=missing, stale=stale, rules_pages=[
+                      [],
+                      [{"type": "required_status_checks", "parameters": {
+                          "required_status_checks": [
+                              {"context": "ruleset-required", "integration_id": 1},
+                          ],
+                      }}],
+                  ])
 
     receipt = collect_acceptance("https://github.com/acme/repo/pull/7",
                                  "https://github.com/acme/repo/pull/7", policy=policy)
 
-    assert not receipt["ok"]
-    assert receipt["classification"] == "missing"
-    assert receipt["verification_source"] is None
+    assert receipt["ok"] is (classification == "success")
+    assert receipt["classification"] == classification
+    assert receipt["required"] == [{"context": "ruleset-required", "app_id": 1}]
+    assert receipt["checks"][0]["name"] == "ruleset-required"
+    assert receipt["verification_source"] == (
+        "required-checks" if classification == "success" else None
+    )
     assert any("page=2" in request for request in github["requests"])
-
-
-@pytest.mark.parametrize("policy", ["required-checks", "local-if-no-required-checks"])
-def test_passing_ruleset_requirement_uses_required_check_evidence(github, policy):
-    github.update(no_required_checks=True, check_name="ruleset-required", rules_pages=[
-        [],
-        [{"type": "required_status_checks", "parameters": {
-            "required_status_checks": [{"context": "ruleset-required", "integration_id": 1}],
-        }}],
-    ])
-
-    receipt = collect_acceptance("https://github.com/acme/repo/pull/7",
-                                 "https://github.com/acme/repo/pull/7", policy=policy)
-
-    assert receipt["ok"]
-    assert receipt["verification_source"] == "required-checks"
 
 
 @pytest.mark.parametrize(("current", "ok", "classification"), [
@@ -214,6 +222,32 @@ def test_final_pr_response_mismatch_closed_and_malformed_paths_fail_closed(githu
 
     assert receipt["ok"] is ok
     assert receipt["classification"] == classification
+
+
+@pytest.mark.parametrize(("current", "pulls_error", "classification"), [
+    ({"head": {"sha": "b" * 40}, "base": {"ref": "main"}, "state": "open", "merged": False}, None, "stale"),
+    ({"head": {"sha": "a" * 40}, "base": {"ref": "other"}, "state": "open", "merged": False}, None, "stale"),
+    ({"head": {"sha": "a" * 40}, "base": {"ref": "main"}, "state": "closed", "merged": False}, None, "stale"),
+    ({"head": {"sha": "a" * 40}, "base": {"ref": "main"}, "state": "corrupt", "merged": False}, None, "infra"),
+    ({"head": {"sha": "a" * 40}, "base": {"ref": "main"}, "state": "open", "merged": "no"}, None, "infra"),
+    ([], None, "infra"),
+    (None, (500, "GitHub temporarily unavailable"), "infra"),
+])
+def test_explicit_local_policy_still_requires_a_matching_final_pr_reread(
+        github, current, pulls_error, classification):
+    github.update(no_required_checks=True)
+    if current is not None:
+        github["current"] = current
+    if pulls_error is not None:
+        github["pulls_error"] = pulls_error
+
+    receipt = collect_acceptance("https://github.com/acme/repo/pull/7",
+                                 "https://github.com/acme/repo/pull/7",
+                                 policy="local-if-no-required-checks")
+
+    assert not receipt["ok"]
+    assert receipt["classification"] == classification
+    assert any("/pulls/7" in request for request in github["requests"])
 
 
 @pytest.mark.parametrize("fault", ["graphql", "rules"])
@@ -381,6 +415,23 @@ def test_only_exact_rules_plan_response_is_sanitized_as_unavailable(github, stat
         assert receipt["ruleset_unavailable"] is True
     else:
         assert receipt["classification"] == "infra"
+
+
+@pytest.mark.parametrize("endpoint", ["graphql", "pulls"])
+def test_plan_visibility_403_from_any_non_rules_endpoint_is_infrastructure_failure(github, endpoint):
+    """The narrow unavailable-rules exception never applies to unrelated endpoints."""
+    error = (403, "Upgrade to GitHub Pro or make this repository public to enable this feature.")
+    github["no_required_checks"] = True
+    github[f"{endpoint}_error"] = error
+
+    receipt = collect_acceptance("https://github.com/acme/repo/pull/7",
+                                 "https://github.com/acme/repo/pull/7",
+                                 policy="local-if-no-required-checks")
+
+    assert not receipt["ok"]
+    assert receipt["classification"] == "infra"
+    if endpoint == "pulls":
+        assert any("/pulls/7" in request for request in github["requests"])
 
 
 def test_cli_policy_round_trip_keeps_blocked_exact_pr_identity(github):
