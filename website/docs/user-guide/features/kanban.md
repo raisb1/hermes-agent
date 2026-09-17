@@ -54,7 +54,29 @@ work; existing and undeclared cards retain that default. Prose URLs are not poli
 
 After publishing, pass `metadata.published_pr` to completion. The first matching
 URL binds the card permanently; retries cannot substitute a green sibling PR.
-CLI `show --json` and `kanban_show` expose the persisted contract.
+CLI `show --json` and `kanban_show` expose the persisted contract and its
+effective PR acceptance policy. The default policy is `required-checks`, for
+new and existing tasks alike. A repository with no discovered required checks
+does not silently become local-only: completion stays nonterminal with an
+actionable `no-required-checks` receipt.
+
+When the task's documented local verification is the authoritative evidence,
+an operator may make that narrow, audited declaration on a nonterminal
+PR-backed task (including a blocked task):
+
+```bash
+hermes kanban --board BOARD set-pr-policy t_abcd \
+  local-if-no-required-checks \
+  --reason "the documented local integration suite is authoritative"
+```
+
+`--reason` is stored with the old/new policy and author in a
+`pr_acceptance_policy_changed` event. Revert with `required-checks` and a
+reason. This policy neither runs arbitrary local commands nor changes the
+immutable PR identity: the first matching published PR URL still binds the
+task permanently. Any discovered classic branch-protection or ruleset check
+remains mandatory under either policy. The independent release-manager merge
+gate is unchanged.
 
 The shared `complete_task` boundary covers worker tools, CLI, review approval and
 dashboard completion. It reads classic branch protection and active ruleset
@@ -63,8 +85,12 @@ re-reads the PR head/base. Optional failed/skipped telemetry does not veto accep
 required checks. Missing, pending, failed, cancelled, timed-out, stale, skipped or
 neutral **required** evidence cannot complete the card. Neither can zero-run
 acceptance, unreadable policy or GitHub API failures. A repository without required
-checks needs a local-only contract. `gh` must be authenticated with read access to
-the repository's checks and rules; no remote writes are performed by this gate.
+checks needs the explicit policy declaration above after local verification is
+documented. `gh` must be authenticated with read access to the repository's
+checks and rules; no remote writes are performed by this gate. GitHub's known
+rules-endpoint plan restriction (HTTP 403 with its exact documented message)
+is recorded as sanitized unavailable-rules evidence, not as proof that no
+rules exist; other API failures still reject completion as infrastructure.
 
 Rejection retains the active card and workspace. Durable `pr_acceptance` events
 store PR URL, SHA, required contexts, check IDs/URLs, classifications and recovery
