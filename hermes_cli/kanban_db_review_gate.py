@@ -107,8 +107,12 @@ def _review_required(conn: sqlite3.Connection, task_id: str, contract: Any) -> b
         return False
     return conn.execute(
         "SELECT 1 FROM task_events WHERE task_id = ? "
-        "AND kind IN ('review_requested', 'changes_requested') LIMIT 1",
-        (task_id,),
+        "AND kind IN ('review_requested', 'changes_requested') "
+        "UNION ALL "
+        "SELECT 1 FROM task_runs WHERE task_id = ? "
+        "AND outcome IN ('review_requested', 'changes_requested') "
+        "LIMIT 1",
+        (task_id, task_id),
     ).fetchone() is not None
 
 

@@ -265,3 +265,164 @@ def test_pr_reviewer_block_unblock_retry_keeps_valid_approval_provenance(
     monkeypatch.setattr("hermes_cli.kanban_pr_acceptance_store.prepare_acceptance", lambda *_args: None)
 
     assert kb.complete_task(conn, task_id, expected_run_id=retry.current_run_id)
+
+
+@pytest.mark.parametrize(("storage", "kind"), [
+    ("event", "review_requested"),
+    ("event", "changes_requested"),
+    ("run", "review_requested"),
+    ("run", "changes_requested"),
+])
+def test_orphaned_durable_review_lifecycle_fails_closed(
+    conn,
+    monkeypatch: pytest.MonkeyPatch,
+    storage: str,
+    kind: str,
+) -> None:
+    """A partial durable review record must never downgrade a PR task to ordinary completion."""
+    task_id = _pr_task(conn)
+    with kb.write_txn(conn):
+        if storage == "event":
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+                (task_id, kind, "{}", 1),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (task_id, "builder", "done", kind, 1, 1),
+            )
+    monkeypatch.setattr("hermes_cli.kanban_pr_acceptance_store.prepare_acceptance", lambda *_args: None)
+
+    ok, reason = kb.complete_task(conn, task_id, with_reason=True)
+
+    assert ok is False
+    assert reason is not None and "same-card review approval refused" in reason
+    assert kb.get_task(conn, task_id).status == "ready"
+
+
+def test_acceptance_race_does_not_bind_owner_repo_contract_before_final_review_gate(
+    conn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _pr_task(conn)
+    _implementation, review = _request_review(conn, task_id)
+    child = kb.create_task(conn, title="QA", assignee="qa", parents=[task_id])
+    before_contract = kb.get_task(conn, task_id).completion_contract
+    after_invalidation: dict[str, object] = {}
+
+    def invalidate_during_collection(_contract, _published_pr, *, policy):
+        assert kb.request_changes(
+            conn, task_id, reason="late review finding", expected_run_id=review.current_run_id,
+        ) == (True, "builder")
+        task = kb.get_task(conn, task_id)
+        after_invalidation.update({
+            "status": task.status,
+            "run": task.current_run_id,
+            "result": task.result,
+            "contract": task.completion_contract,
+            "events": len(kb.list_events(conn, task_id)),
+            "runs": len(kb.list_runs(conn, task_id)),
+            "child": kb.get_task(conn, child).status,
+        })
+        return {"ok": True, "classification": "success", "recovery": "retry"}
+
+    monkeypatch.setattr("hermes_cli.kanban_pr_acceptance_store.collect_acceptance", invalidate_during_collection)
+    ok, reason = kb.complete_task(
+        conn,
+        task_id,
+        expected_run_id=review.current_run_id,
+        metadata={"published_pr": "https://github.com/acme/repo/pull/7"},
+        with_reason=True,
+    )
+
+    assert ok is False
+    assert reason is not None and "current claimed reviewer run" in reason
+    task = kb.get_task(conn, task_id)
+    assert task.completion_contract == before_contract == "acme/repo"
+    assert (task.status, task.current_run_id, task.result, len(kb.list_events(conn, task_id)),
+            len(kb.list_runs(conn, task_id)), kb.get_task(conn, child).status) == (
+        after_invalidation["status"], after_invalidation["run"], after_invalidation["result"],
+        after_invalidation["events"], after_invalidation["runs"], after_invalidation["child"],
+    )
+
+
+def test_stale_reviewer_run_cannot_approve_a_reclaimed_review(conn, monkeypatch: pytest.MonkeyPatch) -> None:
+    task_id = _pr_task(conn)
+    _implementation, first_review = _request_review(conn, task_id)
+    assert kb.block_task(conn, task_id, reason="review interrupted", expected_run_id=first_review.current_run_id)
+    assert kb.unblock_task(conn, task_id)
+    retry = kb.claim_review_task(conn, task_id, claimer="reviewer:retry")
+    assert retry is not None
+    monkeypatch.setattr("hermes_cli.kanban_pr_acceptance_store.prepare_acceptance", lambda *_args: None)
+
+    ok, reason = kb.complete_task(conn, task_id, expected_run_id=first_review.current_run_id, with_reason=True)
+
+    assert ok is False
+    assert reason is not None and "current claimed reviewer run" in reason
+    assert kb.get_task(conn, task_id).current_run_id == retry.current_run_id
+
+
+def test_spoofed_assignee_cannot_turn_rework_run_into_reviewer_approval(
+    conn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _pr_task(conn)
+    _implementation, review = _request_review(conn, task_id)
+    assert kb.request_changes(conn, task_id, reason="fix", expected_run_id=review.current_run_id) == (True, "builder")
+    rework = kb.claim_task(conn, task_id, claimer="builder:rework")
+    assert rework is not None
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", ("reviewer", task_id))
+    monkeypatch.setattr("hermes_cli.kanban_pr_acceptance_store.prepare_acceptance", lambda *_args: None)
+
+    ok, reason = kb.complete_task(conn, task_id, expected_run_id=rework.current_run_id, with_reason=True)
+
+    assert ok is False
+    assert reason is not None and "not claimed from review" in reason
+    assert kb.get_task(conn, task_id).status == "running"
+
+
+def test_event_ids_order_fresh_same_second_rereview_after_changes(
+    conn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _pr_task(conn)
+    _implementation, review = _request_review(conn, task_id)
+    assert kb.request_changes(conn, task_id, reason="fix", expected_run_id=review.current_run_id) == (True, "builder")
+    rework = kb.claim_task(conn, task_id, claimer="builder:rework")
+    assert rework is not None
+    assert kb.request_review(conn, task_id, summary="fixed", expected_run_id=rework.current_run_id)
+    rereview = kb.claim_review_task(conn, task_id, claimer="reviewer:rereview")
+    assert rereview is not None
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET created_at = 1 WHERE task_id = ?", (task_id,))
+    monkeypatch.setattr("hermes_cli.kanban_pr_acceptance_store.prepare_acceptance", lambda *_args: None)
+
+    assert kb.complete_task(conn, task_id, expected_run_id=rereview.current_run_id)
+
+
+def test_repeated_changes_and_rereview_cycles_preserve_fresh_approval(conn, monkeypatch: pytest.MonkeyPatch) -> None:
+    task_id = _pr_task(conn)
+    _implementation, review = _request_review(conn, task_id)
+    for cycle in range(2):
+        assert kb.request_changes(conn, task_id, reason=f"fix {cycle}", expected_run_id=review.current_run_id) == (True, "builder")
+        rework = kb.claim_task(conn, task_id, claimer=f"builder:rework-{cycle}")
+        assert rework is not None
+        assert kb.request_review(conn, task_id, summary=f"fixed {cycle}", expected_run_id=rework.current_run_id)
+        review = kb.claim_review_task(conn, task_id, claimer=f"reviewer:retry-{cycle}")
+        assert review is not None
+    monkeypatch.setattr("hermes_cli.kanban_pr_acceptance_store.prepare_acceptance", lambda *_args: None)
+
+    assert kb.complete_task(conn, task_id, expected_run_id=review.current_run_id)
+
+
+def test_plain_pr_task_never_entered_review_keeps_existing_completion_behavior(
+    conn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _pr_task(conn)
+    monkeypatch.setattr("hermes_cli.kanban_pr_acceptance_store.prepare_acceptance", lambda *_args: None)
+
+    assert kb.complete_task(conn, task_id)

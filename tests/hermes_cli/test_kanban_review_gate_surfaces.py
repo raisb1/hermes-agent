@@ -2,13 +2,19 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+
+
+ROOT = Path(__file__).parents[2]
 
 
 @pytest.fixture
@@ -68,6 +74,41 @@ def test_cli_parser_dispatch_returns_shared_actionable_review_gate_error(guarded
     output = kc.run_slash(f"complete {guarded_worker} --result 'attempt bypass'")
 
     assert "kanban_request_review" in output
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, guarded_worker)
+        assert task is not None
+        assert task.status == "running"
+
+
+def test_registry_dispatch_returns_shared_actionable_review_gate_error(guarded_worker: str) -> None:
+    import model_tools
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    output = json.loads(model_tools.handle_function_call(
+        function_name="kanban_complete", function_args={"summary": "attempt bypass"},
+    ))
+
+    assert "kanban_request_review" in output["error"]
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, guarded_worker)
+        assert task is not None
+        assert task.status == "running"
+
+
+def test_real_cli_completion_returns_nonzero_for_review_gate(guarded_worker: str, tmp_path: Path) -> None:
+    env = os.environ.copy()
+    env.update({"HERMES_HOME": str(tmp_path / ".hermes"), "PYTHONPATH": str(ROOT)})
+    for name in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK"):
+        env.pop(name, None)
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "kanban", "complete", guarded_worker, "--result", "attempt bypass"],
+        cwd=ROOT, env=env, capture_output=True, text=True, check=False, timeout=30,
+    )
+
+    assert completed.returncode != 0
+    assert "kanban_request_review" in completed.stderr
     with kbc.connect() as conn:
         task = kb.get_task(conn, guarded_worker)
         assert task is not None

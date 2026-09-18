@@ -58,23 +58,28 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
         return False
     published_pr = metadata.get("published_pr") if isinstance(metadata, dict) else None
     match = _PR.fullmatch(published_pr) if isinstance(published_pr, str) else None
-    # Publication binds once. Retrying cannot replace the task's PR with a green sibling.
-    if match and contract == match[1]:
-        with write_txn(conn):
-            if _snapshot(conn, task_id) != snapshot:
-                return False
-            conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (published_pr, task_id))
-        snapshot = (run_id, status, published_pr, policy)
-        contract = published_pr
-    return snapshot, collect_acceptance(str(contract), published_pr, policy=policy)
+    # Collection is external work. Preserve OWNER/REPO until the lifecycle
+    # owner rechecks its snapshot and review gate in complete_task's final txn.
+    # Retrying cannot replace the task's PR with a green sibling because the
+    # binding remains a compare-and-set against this captured declaration.
+    pending_contract = published_pr if match and contract == match[1] else None
+    return snapshot, collect_acceptance(str(contract), published_pr, policy=policy), pending_contract
 
 
 def record_acceptance(conn, task_id, acceptance):
     """Called under complete_task's write_txn, before its terminal UPDATE."""
     from hermes_cli.kanban_db import _append_event
-    snapshot, receipt = acceptance
+    snapshot, receipt, pending_contract = acceptance
     if _snapshot(conn, task_id) != snapshot:
         return False
+    if pending_contract is not None:
+        bound = conn.execute(
+            "UPDATE tasks SET completion_contract=? WHERE id=? AND completion_contract=?",
+            (pending_contract, task_id, snapshot[2]),
+        )
+        if bound.rowcount != 1:
+            return False
+        snapshot = (snapshot[0], snapshot[1], pending_contract, snapshot[3])
     _append_event(conn, task_id, "pr_acceptance", receipt, run_id=snapshot[0])
     if not receipt["ok"]:
         detail = f"PR acceptance {receipt['classification']}: {receipt.get('detail', '')} {receipt['recovery']}"
