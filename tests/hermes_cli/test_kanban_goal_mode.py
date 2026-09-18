@@ -169,6 +169,8 @@ class TestCLIJudgeGate:
 
         def fake_complete_task(conn, tid, **kw):
             complete_calls.append(tid)
+            if kw.get("with_reason"):
+                return complete_ok, None
             return complete_ok
 
         monkeypatch.setattr("hermes_cli.kanban.kb.get_task", lambda conn, tid: fake_task)
