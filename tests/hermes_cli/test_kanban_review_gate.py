@@ -426,3 +426,44 @@ def test_plain_pr_task_never_entered_review_keeps_existing_completion_behavior(
     monkeypatch.setattr("hermes_cli.kanban_pr_acceptance_store.prepare_acceptance", lambda *_args: None)
 
     assert kb.complete_task(conn, task_id)
+
+
+@pytest.mark.parametrize("outcome", ["review_requested", "changes_requested"])
+def test_orphaned_later_lifecycle_run_invalidates_an_otherwise_valid_reviewer_approval(
+    conn,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    """A run-only lifecycle record cannot leave an older reviewer handoff valid."""
+    task_id = _pr_task(conn)
+    _implementation, review = _request_review(conn, task_id)
+    child = kb.create_task(conn, title="QA", assignee="qa", parents=[task_id])
+    before = kb.get_task(conn, task_id)
+    assert before is not None
+    before_events = len(kb.list_events(conn, task_id))
+    before_runs = len(kb.list_runs(conn, task_id))
+    with kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (task_id, "reviewer", outcome, outcome, 1, 1),
+        )
+    monkeypatch.setattr("hermes_cli.kanban_pr_acceptance_store.prepare_acceptance", lambda *_args: None)
+
+    ok, reason = kb.complete_task(conn, task_id, expected_run_id=review.current_run_id, with_reason=True)
+
+    assert ok is False
+    assert reason is not None and "same-card review approval refused" in reason
+    after = kb.get_task(conn, task_id)
+    assert after is not None
+    assert (after.status, after.current_run_id, after.result, after.completed_at) == (
+        before.status,
+        before.current_run_id,
+        before.result,
+        before.completed_at,
+    )
+    assert len(kb.list_events(conn, task_id)) == before_events
+    assert len(kb.list_runs(conn, task_id)) == before_runs + 1
+    child_task = kb.get_task(conn, child)
+    assert child_task is not None
+    assert child_task.status == "todo"

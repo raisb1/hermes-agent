@@ -116,6 +116,43 @@ def _review_required(conn: sqlite3.Connection, task_id: str, contract: Any) -> b
     ).fetchone() is not None
 
 
+def _lifecycle_partner_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Fail closed when durable review events and run outcomes disagree.
+
+    A review handoff or change request is persisted as a same-run event/outcome
+    pair.  Event ids establish the ordering used below, while the shared run id
+    prevents an orphaned later run from leaving an older handoff approvable.
+    """
+    events = conn.execute(
+        "SELECT id, run_id, kind FROM task_events WHERE task_id = ? "
+        "AND kind IN ('review_requested', 'changes_requested') ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    runs = conn.execute(
+        "SELECT id, outcome FROM task_runs WHERE task_id = ? "
+        "AND outcome IN ('review_requested', 'changes_requested') ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    runs_by_id = {int(run["id"]): run for run in runs}
+    events_by_run: dict[int, list[sqlite3.Row]] = {}
+    for event in events:
+        kind = str(event["kind"])
+        run_id = event["run_id"]
+        if run_id is None:
+            return f"recorded {kind} lifecycle event has no matching durable run"
+        run = runs_by_id.get(int(run_id))
+        if run is None or run["outcome"] != kind:
+            return f"recorded {kind} lifecycle event has no matching durable run outcome"
+        events_by_run.setdefault(int(run_id), []).append(event)
+    for run in runs:
+        run_id = int(run["id"])
+        outcome = str(run["outcome"])
+        matching_events = events_by_run.get(run_id, [])
+        if len(matching_events) != 1:
+            return f"recorded {outcome} lifecycle run has no unique matching event"
+    return None
+
+
 def completion_gate_reason(
     conn: sqlite3.Connection,
     task_id: str,
@@ -134,6 +171,9 @@ def completion_gate_reason(
     if task is None or not _review_required(conn, task_id, task["completion_contract"]):
         return None
 
+    lifecycle_reason = _lifecycle_partner_reason(conn, task_id)
+    if lifecycle_reason is not None:
+        return f"same-card review approval refused: {lifecycle_reason}; {REVIEW_GATE_RECOVERY}"
     original, malformed_reason = _durable_implementer(conn, task_id)
     if malformed_reason is not None or original is None:
         return f"same-card review approval refused: {malformed_reason or 'missing durable implementer provenance'}; {REVIEW_GATE_RECOVERY}"
