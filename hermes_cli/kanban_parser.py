@@ -332,6 +332,11 @@ _SPECS = [
         _TASK_IDS,
         _reason("Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons."),
     ], help="Send one or more review tasks back for changes (review -> ready/todo)"),
+    _cmd("reopen-rework", [
+        _TASK_ID,
+        _arg("--reason", required=True,
+             help="Nonblank operator reason for reopening an approved implementation"),
+    ], help="Return a done implementation to its original coder and invalidate downstream work"),
     _cmd("promote", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),

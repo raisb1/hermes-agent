@@ -846,6 +846,7 @@ hermes kanban archive <id>...
 hermes kanban request-review <id> [--summary "..."] [--metadata JSON] [--reviewer PROFILE]
 hermes kanban request-changes <id> "<required changes>"               # active reviewer -> implementer
 hermes kanban reopen-review  <id>... [--reason "..."]                 # changes requested: 'review' -> ready/todo
+hermes kanban reopen-rework  <id> --reason "<required changes>"        # done implementation -> original coder
 
 hermes kanban tail <id>                                # follow a single task's event stream
 hermes kanban watch [--assignee P] [--tenant T]        # live stream ALL events to the terminal
@@ -873,6 +874,28 @@ hermes kanban gc [--event-retention-days N]            # workspaces + old events
 ```
 
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
+
+### Reopening an approved implementation for rework
+
+`reopen-rework` is the audited recovery path for a completed implementation whose
+original PR needs additional same-card work. It accepts exactly one `done` task,
+recovers the original coder only from its latest durable review handoff, restores
+that coder to `ready` (or `todo` while a parent is unfinished), and invalidates
+downstream QA/release work in the same database transaction. It records the
+redacted reason, operator, restored coder, and landing status as an event and
+comment; any active invalidated descendant worker is reclaimed only after that
+audit is committed.
+
+Python callers can use
+`hermes_cli.kanban_db_rework.reopen_task_for_rework(conn, task_id, *, reason, author)`;
+it returns `(True, implementer)` on success or `(False, actionable_reason)` when
+the task cannot be reopened.
+
+Before using it, the operator or triage caller must verify that the original PR is
+still open and its preserved worktree and branch are valid. The command does not
+perform GitHub or filesystem checks, create a branch or task, merge/deploy, or
+approve review. After the coder's rework, the card must go through same-card
+review again.
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
 
