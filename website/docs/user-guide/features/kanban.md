@@ -108,6 +108,34 @@ guard, not OS isolation against arbitrary direct database writes. GitHub Enterpr
 is not covered. Related publication/lifecycle work: #91230, #84254, #52311; local
 verification and publication alone are not remote acceptance.
 
+### Same-card review gate for PR work
+
+PR-backed cards retain ordinary completion semantics until they enter the same-card
+review lifecycle. Once a `review_requested` or `changes_requested` handoff is
+recorded, completion is guarded by durable event and run provenance rather than by a
+title, comment, assignee, or GitHub review. The first PR review handoff must name a
+nonblank reviewer profile distinct from the claimed implementer; re-review may reuse
+the reviewer recorded by a valid `changes_requested` handoff. The original
+implementer identity remains immutable across reassignment and rework.
+
+A guarded card may complete only from a currently claimed `review` run whose profile
+matches a fresh `review_requested` handoff and differs from that original
+implementer. `changes_requested` and `rework_requested` invalidate prior approval;
+a repaired card must request review again and a distinct reviewer must claim and
+approve the new handoff. A review retry after an audited block, unblock, reclaim, or
+reclaim-by-dispatch remains a review run and can approve its still-current handoff.
+
+This check runs before PR-acceptance collection and again in the terminal SQLite
+transaction before receipts, state changes, artifacts, workspace cleanup, or child
+promotion. Failed approval attempts leave the task, current run, result, and
+descendants unchanged. CLI, tool, and dashboard completion all use the same boundary.
+For operator recovery, use the audited request-review, reopen-review, or
+reopen-rework transitions to restore a valid handoff; a run-id-less manual completion
+is never an approval bypass. Cards without a PR contract, and PR cards that have not
+entered same-card review, keep their existing completion behavior. Missing or
+malformed provenance in a recorded PR review lifecycle fails closed with instructions
+to request a fresh same-card review.
+
 ## Kanban vs. `delegate_task`
 
 They look similar; they are not the same primitive.
@@ -376,7 +404,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_show` | Read the current task (title, body, prior attempts, parent handoffs, comments, full pre-formatted `worker_context`). Defaults to the env's task id. | — |
 | `kanban_list` | List task summaries with filters for `assignee`, `status`, `tenant`, archived visibility, and limit. Intended for orchestrators discovering board work. | — |
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
-| `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
+| `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and reviewer profile. The task moves to `review`; this is not a block. PR-backed tasks require a nonblank reviewer distinct from the durable implementer; legacy local-only tasks keep the optional reviewer behavior. | `summary` (plus `reviewer` for PR-backed tasks) |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |

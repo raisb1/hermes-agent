@@ -2534,8 +2534,8 @@ def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
-    fire_lifecycle_hook: bool = True,
-) -> bool:
+    fire_lifecycle_hook: bool = True, with_reason: bool = False,
+) -> Any:
     """``running|ready|blocked|review -> done``; records ``result``.
 
     ``ready`` is accepted for manual CLI completion, ``review`` for human
@@ -2546,11 +2546,17 @@ def complete_task(
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
     """
+    def _ret(ok: bool, reason: Optional[str] = None):
+        return (ok, reason) if with_reason else ok
+
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
-        return False
+        return _ret(False, "parent dependencies are not satisfied")
+    from hermes_cli.kanban_db_review_gate import completion_gate_reason
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
+    if review_reason := completion_gate_reason(conn, task_id, expected_run_id=expected_run_id):
+        return _ret(False, review_reason)
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
@@ -2558,14 +2564,18 @@ def complete_task(
     handoff_summary = summary if summary is not None else result
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
-        return False
+        return _ret(False, "PR acceptance requirements are not satisfied")
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
-            return False
+            return _ret(False, "parent dependencies are not satisfied")
+        # Acceptance collection performs network I/O outside the write lock.
+        # Recheck before receipts, state, runs, artifacts, or child promotion.
+        if review_reason := completion_gate_reason(conn, task_id, expected_run_id=expected_run_id):
+            return _ret(False, review_reason)
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
-            return False
+            return _ret(False, "PR acceptance changed or is no longer valid")
         prior_status = _task_status(conn, task_id)
         sql = """
                 UPDATE tasks
@@ -2585,7 +2595,7 @@ def complete_task(
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
         if conn.execute(sql, params).rowcount != 1:
-            return False
+            return _ret(False, "task is not completable from its current status or run")
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
         run_id = _end_run(
@@ -2617,7 +2627,7 @@ def complete_task(
     _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
         _fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)
-    return True
+    return _ret(True)
 
 
 _REVIEW_APPROVED_NOTE = "Review approved without additional evidence."
@@ -3021,7 +3031,7 @@ def request_review(
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
+            "SELECT assignee, status, claim_lock, current_run_id, completion_contract "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -3049,6 +3059,17 @@ def request_review(
                     "malformed); pass reviewer= explicitly",
                 )
         reviewer = _canonical_assignee(reviewer)
+        from hermes_cli.kanban_db_review_gate import review_request_provenance
+        durable_implementer, reviewer, provenance_reason = review_request_provenance(
+            conn,
+            task_id,
+            contract=trow["completion_contract"],
+            current_run_id=trow["current_run_id"],
+            reviewer=reviewer,
+        )
+        if provenance_reason is not None:
+            return _ret(False, provenance_reason)
+        implementer = durable_implementer or implementer
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
         params: tuple[Any, ...] = (
