@@ -571,9 +571,9 @@ def _handle_complete(args: dict, **kw) -> str:
         task = kb.get_task(conn, tid)
         _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
         try:
-            ok = kb.complete_task(
+            ok, fail_reason = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
-                created_cards=created_cards, expected_run_id=_worker_run_id(tid))
+                created_cards=created_cards, expected_run_id=_worker_run_id(tid), with_reason=True)
         except kb.ArtifactPreservationError as artifact_err:
             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
             # or drop the field. Audit event already landed in the DB. The task itself was NOT mutated (the
@@ -596,7 +596,7 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"summary/metadata and either drop these ids from created_cards, or pass "
                 f"created_cards=[] to skip the card-claim check entirely.")
         task = kb.get_task(conn, tid)
-        _check(ok, (task.last_failure_error if task else None) or
+        _check(ok, fail_reason or (task.last_failure_error if task else None) or
                f"could not complete {tid} (unknown id, stale run, or already terminal)")
         run = kb.latest_run(conn, tid)
         return _ok(task_id=tid, run_id=run.id if run else None)
