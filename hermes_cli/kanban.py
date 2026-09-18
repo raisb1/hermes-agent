@@ -19,6 +19,7 @@ from typing import Optional
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_rework as kbr
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
@@ -216,7 +217,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "set-pr-policy", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "request-review", "request-changes", "reopen-review",
+    "request-review", "request-changes", "reopen-review", "reopen-rework",
     "gc",
 })
 
@@ -1031,6 +1032,23 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
                            lambda tid: f"cannot reopen {tid} (not in review?)")
 
 
+def _cmd_reopen_rework(args: argparse.Namespace) -> int:
+    tid = args.task_id
+    with kbc.connect_closing() as conn:
+        ok, detail = kbr.reopen_task_for_rework(
+            conn,
+            tid,
+            reason=getattr(args, "reason", ""),
+            author=_profile_author(),
+        )
+        if not ok:
+            return _err(f"cannot reopen {tid} for rework: {detail or 'invalid task state'}")
+        task = kb.get_task(conn, tid)
+        status = task.status if task else "ready"
+    print(f"Reopened {tid} for rework; routed to {detail} ({status})")
+    return 0
+
+
 def _cmd_promote(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     author = _profile_author()
@@ -1263,7 +1281,7 @@ _HANDLERS = {
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
-    "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
+    "reopen-review": _cmd_reopen_review, "reopen-rework": _cmd_reopen_rework, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
