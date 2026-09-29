@@ -5,6 +5,7 @@ are imported lazily inside the functions that use them (avoids an import cycle).
 """
 
 import logging
+import os
 import subprocess
 import sys
 
