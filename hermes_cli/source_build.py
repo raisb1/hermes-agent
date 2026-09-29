@@ -40,6 +40,14 @@ def source_build_env(base_env: dict | None = None, *, explicit: bool = False) ->
     env = {**os.environ, **(base_env or {}), "CI": "1", "HERMES_PYTHON": python,
            "PYTHON": python}
     env.pop("ESBUILD_BINARY_PATH", None)
+    # SteamOS's immutable root ships GCC's header shims but not the full
+    # glibc/kernel dev headers, and /usr/include is read-only — node-gyp's
+    # compile of native addons (node-pty's pty.cc) then fails on a missing
+    # stdint.h even though gcc/g++ are present. Layer in -idirafter
+    # CFLAGS/CXXFLAGS pointing at a fetched header set. No-op off SteamOS.
+    from hermes_cli.main_web_build import _steamos_glibc_header_env
+    if steamos_headers := _steamos_glibc_header_env():
+        env.update(steamos_headers)
     npmrc = get_hermes_home() / "npmrc"
     if npmrc.is_file():
         env.setdefault("NPM_CONFIG_USERCONFIG", str(npmrc))

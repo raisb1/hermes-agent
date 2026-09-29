@@ -233,8 +233,10 @@ class CLIAgentSetupMixin:
 
     def _ensure_runtime_credentials(self) -> bool:
         """Re-resolve provider credentials before agent use so key rotation / token
-        refresh are picked up without restarting the CLI. False on auth failure."""
+        refresh are picked up without restarting the CLI. False on auth failure.
+        """
         from cli import ChatConsole, logger
+        from hermes_cli.auth import is_rate_limited_auth_error
         from hermes_cli.runtime_provider import resolve_runtime_provider, format_runtime_provider_error
         _primary_exc = None
         runtime = None

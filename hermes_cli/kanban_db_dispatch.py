@@ -195,15 +195,40 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
-# Windows has no ``waitpid(-1)``: a child's exit code is only recoverable
-# through a live handle, so ``_default_spawn`` parks each worker's ``Popen``
-# here (Windows only) and ``reap_worker_zombies`` polls it. Entry: ``pid -> Popen``.
+# Live ``Popen`` handles for workers this process spawned, keyed by pid. A Popen
+# whose object is dropped without ``wait()`` is parked by CPython in
+# ``subprocess._active`` and silently reaped by the NEXT ``Popen`` anywhere in
+# the process (``subprocess._cleanup``) — a cron script, a ``ps`` probe in
+# ``_pid_alive`` — so by the time ``reap_worker_zombies`` runs ``waitpid(-1)``
+# there is no child left and the exit status (including the rate-limit
+# sentinel 75) is lost: the worker is classified ``unknown`` and the task takes
+# a crash strike for a quota wall. Holding the handle keeps the child out of
+# ``_active``; ``reap_worker_zombies`` polls these first so the status is ours.
 _live_worker_procs: "dict[int, subprocess.Popen]" = {}
 
 
-def _wait_status_from_returncode(returncode: int) -> int:
-    """Encode a ``Popen.returncode`` in the wait-status layout the registry stores."""
-    return (int(returncode) & 0xFF) << 8
+def _register_worker_proc(proc: "subprocess.Popen") -> None:
+    if proc.pid and proc.pid > 0:
+        _live_worker_procs[int(proc.pid)] = proc
+
+
+def _reap_registered_workers() -> "list[int]":
+    """Reap exited workers via their retained handles; record real exit codes."""
+    reaped: "list[int]" = []
+    for pid, proc in list(_live_worker_procs.items()):
+        try:
+            rc = proc.poll()
+        except Exception:
+            rc = None
+        if rc is None:
+            continue
+        _live_worker_procs.pop(pid, None)
+        # Reconstruct a raw wait status so _classify_worker_exit's
+        # WIFEXITED/WIFSIGNALED path is unchanged: negative rc == signal.
+        raw = (-rc) if rc < 0 else (rc << 8)
+        _record_worker_exit(pid, raw)
+        reaped.append(pid)
+    return reaped
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
@@ -279,32 +304,27 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
 
 
 def reap_worker_zombies() -> "list[int]":
-    """Reap exited workers without blocking; returns reaped PIDs. POSIX reaps
-    every child via ``waitpid(-1)``; Windows polls the ``Popen`` handles
-    parked by ``_default_spawn`` (the only way to learn a child's exit code
-    there), so the rate-limit sentinel exit is classified on both hosts."""
-    reaped: "list[int]" = []
-    if _kb._IS_WINDOWS:
-        for pid, proc in list(_live_worker_procs.items()):
-            returncode = proc.poll()
-            if returncode is None:
-                continue
-            _record_worker_exit(pid, _wait_status_from_returncode(returncode))
-            _live_worker_procs.pop(pid, None)
-            reaped.append(pid)
-        return reaped
-    try:
-        while True:
-            try:
-                pid, status = os.waitpid(-1, os.WNOHANG)
-            except ChildProcessError:
-                break
-            if pid == 0:
-                break
-            _record_worker_exit(pid, status)
-            reaped.append(pid)
-    except Exception:
-        pass
+    """Reap all zombie children without blocking; returns reaped PIDs. No-op on Windows.
+
+    Workers spawned by this process are reaped through their retained ``Popen``
+    handles first (real exit status, see ``_live_worker_procs``); the
+    ``waitpid(-1)`` sweep then covers anything else.
+    """
+    reaped: "list[int]" = _reap_registered_workers()
+    if os.name != "nt":
+        try:
+            while True:
+                try:
+                    pid, status = os.waitpid(-1, os.WNOHANG)
+                except ChildProcessError:
+                    break
+                if pid == 0:
+                    break
+                _live_worker_procs.pop(pid, None)
+                _record_worker_exit(pid, status)
+                reaped.append(pid)
+        except Exception:
+            pass
     return reaped
 
 
@@ -1505,6 +1525,24 @@ def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: i
             _kb._append_event(conn, task_id, "worker_registered", {"pid": int(pid), "started_at": started_at},
                               run_id=int(run_id))
     return True
+
+
+def set_worker_session_id(conn: sqlite3.Connection, task_id: str, session_id: Optional[str]) -> None:
+    """Record the worker's own Hermes session id on its current task_runs row (idempotent).
+
+    Only fills a run's ``worker_session_id`` when it is currently NULL, so a stale or
+    replayed call can't overwrite a legitimate value already recorded for that run.
+    """
+    if not session_id:
+        return
+    with _kb.write_txn(conn):
+        run_id = _kb._current_run_id(conn, task_id)
+        if run_id is not None:
+            conn.execute(
+                "UPDATE task_runs SET worker_session_id = ? "
+                "WHERE id = ? AND worker_session_id IS NULL",
+                (session_id, run_id),
+            )
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -2967,8 +3005,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         )
     # Intentionally NOT closing log_f: the child keeps writing after return;
     # the OS-level FD stays open in the child until it exits.
-    if _kb._IS_WINDOWS:
-        _live_worker_procs[proc.pid] = proc
+    _register_worker_proc(proc)
     return proc.pid
 
 

@@ -257,6 +257,13 @@ _SPECS = [
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),
     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+    _cmd("set-pr-policy", [
+        _TASK_ID,
+        _arg("policy", choices=("required-checks", "local-if-no-required-checks"),
+             help="PR acceptance policy; strict required-checks is the default"),
+        _arg("--reason", required=True,
+             help="Audit declaration for this policy change; local verification authority for the local policy"),
+    ], help="Set the audited PR acceptance policy on a nonterminal PR-backed task"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
     _cmd("reassign", [
         _TASK_ID,
@@ -347,6 +354,11 @@ _SPECS = [
         _TASK_IDS,
         _reason("Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons."),
     ], help="Send one or more review tasks back for changes (review -> ready/todo)"),
+    _cmd("reopen-rework", [
+        _TASK_ID,
+        _arg("--reason", required=True,
+             help="Nonblank operator reason for reopening an approved implementation"),
+    ], help="Return a done implementation to its original coder and invalidate downstream work"),
     _cmd("promote", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),

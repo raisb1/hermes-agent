@@ -396,7 +396,7 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override completion_contract last_failure_error".split())
+    "provider_override completion_contract pr_acceptance_policy last_failure_error".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
     "created_at started_at completed_at current_run_id model_override provider_override".split())
@@ -640,7 +640,7 @@ def _handle_show(args: dict, **kw) -> str:
     tid = _require_task_id(args)
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
-        return json.dumps({
+        response = {
             "task": _fields(task, _TASK_FIELDS),
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency
@@ -653,7 +653,13 @@ def _handle_show(args: dict, **kw) -> str:
             "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
             "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
             # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": kb.build_worker_context(conn, tid)})
+            "worker_context": kb.build_worker_context(conn, tid)}
+        from hermes_cli.kanban_pr_acceptance import effective_policy
+        try:
+            response["task"]["pr_acceptance_policy"] = effective_policy(task.pr_acceptance_policy)
+        except ValueError:
+            pass
+        return json.dumps(response)
 
 
 @_kanban_handler("kanban_list")
@@ -705,15 +711,17 @@ def _handle_complete(args: dict, **kw) -> str:
     _require_dict_metadata(metadata)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     with _board(args.get("board")) as (kb, conn):
+        from hermes_cli import kanban_db_dispatch as kbd
+        kbd.set_worker_session_id(conn, tid, _own_task_env(tid, "HERMES_SESSION_ID"))
         # Goal-mode pre-completion judge gate (Issue #38367). Prevent workers from bypassing the auxiliary
         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
         _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
         try:
-            ok = kb.complete_task(
+            ok, fail_reason = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
-                created_cards=created_cards, expected_run_id=_worker_run_id(tid))
+                created_cards=created_cards, expected_run_id=_worker_run_id(tid), with_reason=True)
         except kb.ArtifactPreservationError as artifact_err:
             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
             # or drop the field. Audit event already landed in the DB. The task itself was NOT mutated (the
@@ -750,10 +758,14 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"what was done.")
         task = kb.get_task(conn, tid)
         if not ok:
-            # complete_task reports every refusal as bare False; a reopened or
-            # never-finished parent is the actionable one. Name the blockers so
-            # the worker/operator completes the parents instead of re-running.
+            # Name the blocking parents FIRST: complete_task's own reason for a parent
+            # block is the generic "parent dependencies are not satisfied", while
+            # unsatisfied_parents() names the ids and statuses a worker must act on.
+            # fail_reason still wins for every non-parent refusal (review gate, PR
+            # acceptance, empty completion), which unsatisfied_parents cannot explain.
             blockers = kb.unsatisfied_parents(conn, tid)
+            if not blockers and fail_reason:
+                _check(False, fail_reason)
             if blockers:
                 detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
                 raise _Reject(
@@ -840,6 +852,8 @@ def _handle_request_review(args: dict, **kw) -> str:
                f"reviewer profile {reviewer!r} is not installed. "
                f"Installed profiles: {', '.join(list_profile_names())}")
     with _board(args.get("board")) as (kb, conn):
+        from hermes_cli import kanban_db_dispatch as kbd
+        kbd.set_worker_session_id(conn, tid, _own_task_env(tid, "HERMES_SESSION_ID"))
         _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
         try:
             ok, fail_reason = kb.request_review(
@@ -886,6 +900,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         ok = kbd.heartbeat_worker(
             conn, tid, note=args.get("note"), expected_run_id=_worker_run_id(tid))
         _check(ok, f"could not heartbeat {tid} (unknown id or not running)")
+        kbd.set_worker_session_id(conn, tid, _own_task_env(tid, "HERMES_SESSION_ID"))
         return _ok(task_id=tid)
 
 

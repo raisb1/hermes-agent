@@ -115,6 +115,126 @@ def _nixos_build_env() -> dict[str, str] | None:
     stop_for_relaunch()
 
 
+def _fetch_steamos_glibc_headers(cache_dir: Path, glibc_version: str | None) -> bool:
+    """Download and unpack glibc + linux-api-headers into *cache_dir*.
+
+    Fetches the exact-matching packages from the distro's own package
+    mirror (the URL ``pacman -Sp`` prints) via curl, then unpacks with the
+    system ``tar --zstd`` (Python's stdlib ``tarfile`` has no zstd
+    support). Returns whether the cache is now populated and usable.
+    """
+    from hermes_platform.resolver.core import locate_command
+    if locate_command("tar").kind == "missing":
+        return False
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        for pkg in ("glibc", "linux-api-headers"):
+            url_result = subprocess.run(
+                ["pacman", "-Sp", pkg],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                check=False, timeout=15,
+            )
+            url = url_result.stdout.strip().splitlines()[-1] if url_result.returncode == 0 else None
+            if not url:
+                return False
+            archive = cache_dir / f"{pkg}.pkg.tar.zst"
+            dl = subprocess.run(
+                ["curl", "-fsSL", "-o", str(archive), url],
+                check=False, timeout=120,
+            )
+            if dl.returncode != 0 or not archive.exists():
+                return False
+            extract = subprocess.run(
+                ["tar", "--zstd", "-xf", str(archive), "-C", str(cache_dir)],
+                check=False, timeout=60,
+            )
+            archive.unlink(missing_ok=True)
+            if extract.returncode != 0:
+                return False
+        if glibc_version:
+            (cache_dir / ".glibc-version").write_text(glibc_version, encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def _steamos_glibc_header_env() -> dict[str, str] | None:
+    """Return extra CFLAGS/CXXFLAGS for native module builds on SteamOS.
+
+    SteamOS's immutable root ships GCC's own header shims in
+    ``/usr/include`` but not the full glibc/kernel dev headers
+    (``stdint.h``, ``linux/types.h``, etc.), and ``/usr/include`` is
+    read-only so they can't be installed in place. node-gyp's C++ compile
+    for native addons (node-pty's ``pty.cc``) then fails with ``fatal
+    error: stdint.h: No such file or directory`` even though gcc/g++ are
+    present, because the ``#include_next`` header chain has a gap.
+
+    Fetches the exact-matching ``glibc``/``linux-api-headers`` packages
+    from the distro's own mirror into a machine-local cache under
+    ``~/.hermes/cache/steamos-glibc-headers`` (re-fetched automatically
+    when the installed ``glibc`` package version drifts from the cached
+    one — a stale cache would carry version-mismatched prototypes), and
+    points the compiler at that tree with ``-idirafter`` — appended to the
+    END of the search path, so it never shadows a header that already
+    exists in ``/usr/include``. ``CPATH`` would instead PREPEND and break
+    GCC's own header shim chaining.
+
+    Returns an env dict suitable for ``subprocess.run(env=...)``, or
+    ``None`` when we are not on SteamOS, ``pacman``/``curl``/``tar`` are
+    unavailable, or the fetch fails — same fail-open contract as
+    :func:`_nixos_build_env`, falling through to node-gyp's normal
+    (likely-failing) behavior rather than raising.
+    """
+    import re
+
+    try:
+        os_release = Path("/etc/os-release").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not re.search(r"^ID=steamos$", os_release, re.M):
+        return None
+
+    from hermes_platform.resolver.core import locate_command
+    if any(locate_command(_t).kind == "missing" for _t in ("pacman", "curl")):
+        return None
+
+    from hermes_constants import get_hermes_home
+    cache_dir = get_hermes_home() / "cache" / "steamos-glibc-headers"
+    version_marker = cache_dir / ".glibc-version"
+    include_dir = cache_dir / "usr" / "include"
+
+    try:
+        glibc_q = subprocess.run(
+            ["pacman", "-Q", "glibc"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            check=False, timeout=10,
+        )
+        current_version = glibc_q.stdout.strip().split()[-1] if glibc_q.returncode == 0 else None
+    except Exception:
+        current_version = None
+
+    cached_version = None
+    if version_marker.exists():
+        try:
+            cached_version = version_marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            cached_version = None
+
+    stale = bool(current_version) and cached_version != current_version
+    if not (include_dir / "stdint.h").exists() or stale:
+        if not _fetch_steamos_glibc_headers(cache_dir, current_version):
+            return None
+
+    if not (include_dir / "stdint.h").exists():
+        return None
+
+    env = dict(os.environ)
+    extra = f"-idirafter {include_dir}"
+    for var in ("CFLAGS", "CXXFLAGS"):
+        env[var] = f"{env[var]} {extra}" if env.get(var) else extra
+    return env
+
+
 def _run_npm_install_deterministic(
     npm: str, cwd: Path, *, extra_args: tuple[str, ...] = (), capture_output: bool = True,
     env: dict[str, str] | None = None) -> subprocess.CompletedProcess:

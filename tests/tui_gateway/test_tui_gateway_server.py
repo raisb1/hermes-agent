@@ -17589,9 +17589,20 @@ def test_session_activate_can_omit_duplicate_desktop_transcript(monkeypatch):
 
 def test_session_most_recent_returns_first_non_denied(monkeypatch):
     """Drops `tool` rows like session.list does, returns the first hit."""
+    seen: dict = {}
 
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
+        def list_sessions_rich(
+            self, *, source=None, sources=None, limit=200,
+            order_by_last_active=False, compact_rows=False,
+        ):
+            seen.update({
+                "source": source,
+                "sources": sources,
+                "limit": limit,
+                "order_by_last_active": order_by_last_active,
+                "compact_rows": compact_rows,
+            })
             return [
                 {"id": "tool-1", "source": "tool", "title": "noise", "started_at": 100},
                 {"id": "tui-1", "source": "tui", "title": "real", "started_at": 99},
@@ -17606,11 +17617,23 @@ def test_session_most_recent_returns_first_non_denied(monkeypatch):
     assert resp["result"]["session_id"] == "tui-1"
     assert resp["result"]["title"] == "real"
     assert resp["result"]["source"] == "tui"
+    # The listing contract most_recent relies on: newest-first, compact rows, no
+    # source pre-filter (the deny-list is applied in Python, not SQL).
+    assert seen == {
+        "source": None,
+        "sources": None,
+        "limit": 200,
+        "order_by_last_active": True,
+        "compact_rows": True,
+    }
 
 
 def test_session_most_recent_returns_null_when_only_tool_rows(monkeypatch):
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
+        def list_sessions_rich(
+            self, *, source=None, sources=None, limit=200,
+            order_by_last_active=False, compact_rows=False,
+        ):
             return [{"id": "tool-1", "source": "tool", "started_at": 1}]
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -17627,7 +17650,10 @@ def test_session_most_recent_skips_unknown_source_rows(monkeypatch):
     picked for auto-resume — the row can outrank the session the user actually opened."""
 
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
+        def list_sessions_rich(
+            self, *, source=None, sources=None, limit=200,
+            order_by_last_active=False, compact_rows=False,
+        ):
             return [
                 {"id": "guard-1", "source": "unknown", "title": "", "started_at": 101},
                 {"id": "tui-1", "source": "tui", "title": "real", "started_at": 100},
@@ -17645,7 +17671,10 @@ def test_session_most_recent_skips_unknown_source_rows(monkeypatch):
 
 def test_session_most_recent_returns_null_when_only_unknown_rows(monkeypatch):
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
+        def list_sessions_rich(
+            self, *, source=None, sources=None, limit=200,
+            order_by_last_active=False, compact_rows=False,
+        ):
             return [{"id": "guard-1", "source": "unknown", "started_at": 1}]
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -17663,7 +17692,10 @@ def test_session_most_recent_folds_db_exception_into_null_result(monkeypatch):
     'no answer' (Copilot review on #17130)."""
 
     class _BrokenDB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
+        def list_sessions_rich(
+            self, *, source=None, sources=None, limit=200,
+            order_by_last_active=False, compact_rows=False,
+        ):
             raise RuntimeError("db locked")
 
     monkeypatch.setattr(server, "_get_db", lambda: _BrokenDB())
@@ -17674,6 +17706,29 @@ def test_session_most_recent_folds_db_exception_into_null_result(monkeypatch):
 
     assert "error" not in resp
     assert resp["result"]["session_id"] is None
+
+
+def test_session_most_recent_filters_hidden_sources_with_real_db(monkeypatch, tmp_path):
+    """The real SessionDB ordering and source filter retain the newest human row."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("human-tip", source="tui")
+    db.create_session("tool-noise", source="tool")
+    db.create_session("kanban-noise", source="kanban")
+    active_at = time.time()
+    db.touch_session_activity("human-tip", active_at + 1.0, description="human")
+    db.touch_session_activity("tool-noise", active_at + 2.0, description="tool")
+    db.touch_session_activity("kanban-noise", active_at + 3.0, description="kanban")
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.most_recent", "params": {}}
+    )
+
+    assert resp is not None
+    assert resp["result"]["session_id"] == "human-tip"
+    assert resp["result"]["source"] == "tui"
 
 
 def test_session_most_recent_handles_db_unavailable(monkeypatch):

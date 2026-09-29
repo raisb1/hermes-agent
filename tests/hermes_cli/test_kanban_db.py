@@ -1561,6 +1561,114 @@ def test_connect_heals_reduced_tasks_schema_seeded_by_external_harness(kanban_ho
         conn.close()
 
 
+def test_migrate_adds_task_runs_worker_session_id_column(kanban_home):
+    """Legacy ``task_runs`` tables (created before this column existed) get
+    ``worker_session_id`` added by ``_migrate_add_optional_columns``, and
+    running the migration twice is a no-op (idempotent)."""
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.isolation_level = None
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL,
+            assignee TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER,
+            worker_pid INTEGER,
+            max_runtime_seconds INTEGER,
+            last_heartbeat_at INTEGER,
+            current_run_id INTEGER,
+            started_at INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE task_events (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id    TEXT NOT NULL DEFAULT '',
+            run_id     INTEGER,
+            kind       TEXT NOT NULL DEFAULT '',
+            payload    TEXT,
+            created_at INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    # Legacy-shaped task_runs: no worker_session_id column.
+    conn.execute(
+        """
+        CREATE TABLE task_runs (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id             TEXT NOT NULL,
+            profile             TEXT,
+            step_key            TEXT,
+            status              TEXT NOT NULL,
+            claim_lock          TEXT,
+            claim_expires       INTEGER,
+            worker_pid          INTEGER,
+            max_runtime_seconds INTEGER,
+            last_heartbeat_at   INTEGER,
+            started_at          INTEGER NOT NULL,
+            ended_at            INTEGER,
+            outcome             TEXT,
+            summary             TEXT,
+            metadata            TEXT,
+            error               TEXT
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO task_runs (id, task_id, status, started_at) "
+        "VALUES (1, 'legacy', 'running', 1)"
+    )
+    conn.commit()
+
+    before = {r["name"] for r in conn.execute("PRAGMA table_info(task_runs)")}
+    assert "worker_session_id" not in before
+
+    kbc._migrate_add_optional_columns(conn)
+    after = {r["name"] for r in conn.execute("PRAGMA table_info(task_runs)")}
+    assert "worker_session_id" in after
+
+    row = conn.execute("SELECT worker_session_id FROM task_runs WHERE id = 1").fetchone()
+    assert row["worker_session_id"] is None
+
+    # Idempotent: running again must not raise, and must not disturb the row.
+    kbc._migrate_add_optional_columns(conn)
+    row_again = conn.execute("SELECT worker_session_id FROM task_runs WHERE id = 1").fetchone()
+    assert row_again["worker_session_id"] is None
+    conn.close()
+
+
+def test_set_worker_session_id_keeps_first_value(kanban_home):
+    """``set_worker_session_id`` only fills a NULL column; a second call with a
+    different id (a stale/replayed write) must not overwrite the first,
+    legitimate value — the idempotent-write contract."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        kb.claim_task(conn, t)
+
+        kbd.set_worker_session_id(conn, t, "session-1")
+        run = kb.latest_run(conn, t)
+        assert run.worker_session_id == "session-1"
+
+        # A second, different session id must not overwrite the first.
+        kbd.set_worker_session_id(conn, t, "session-2")
+        run_again = kb.latest_run(conn, t)
+        assert run_again.worker_session_id == "session-1"
+
+        # Falsy/empty input is a no-op (guards against callers passing None
+        # when a worker isn't scoped to the task).
+        kbd.set_worker_session_id(conn, t, None)
+        kbd.set_worker_session_id(conn, t, "")
+        assert kb.latest_run(conn, t).worker_session_id == "session-1"
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher spawn invocation — _resolve_hermes_argv()
 #
@@ -2006,6 +2114,42 @@ def test_write_txn_check_reads_correct_header_fields(tmp_path):
 # ---------------------------------------------------------------------------
 # reap_worker_zombies() tests
 # ---------------------------------------------------------------------------
+
+
+def test_worker_exit_status_survives_intervening_subprocess_calls(monkeypatch):
+    """A worker's real exit code must reach ``_classify_worker_exit`` even when
+    other ``subprocess`` calls run between its exit and the reap tick.
+
+    ``_spawn_worker`` keeps only the pid; CPython parks the dropped ``Popen`` in
+    ``subprocess._active`` and the next ``Popen`` anywhere in the process reaps
+    it silently, so ``waitpid(-1)`` then finds no child and the rate-limit
+    sentinel (75) degrades to ``unknown`` → a crash strike for a quota wall.
+    """
+    import gc
+    import subprocess
+    from hermes_cli import kanban_db_dispatch as _kbd
+    from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+
+    monkeypatch.setattr(_kbd, "_live_worker_procs", {})
+    monkeypatch.setattr(_kbd, "_recent_worker_exits", {})
+
+    def spawn_like_dispatcher() -> int:
+        proc = subprocess.Popen(["sh", "-c", f"exit {KANBAN_RATE_LIMIT_EXIT_CODE}"])
+        _kbd._register_worker_proc(proc)
+        return proc.pid  # Popen object dropped here, exactly like _spawn_worker
+
+    pid = spawn_like_dispatcher()
+    deadline = time.time() + 5
+    while _kbd._pid_alive(pid) and time.time() < deadline:
+        time.sleep(0.05)
+    gc.collect()
+    # Anything else the gateway does between ticks — a `ps` probe, a cron
+    # script — triggers subprocess._cleanup() on the orphaned handle.
+    subprocess.run(["true"], check=False)
+
+    assert pid in _kbd.reap_worker_zombies()
+    assert _kbd._classify_worker_exit(pid) == ("rate_limited", KANBAN_RATE_LIMIT_EXIT_CODE)
+    assert pid not in _kbd._live_worker_procs
 
 
 

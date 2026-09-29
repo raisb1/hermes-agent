@@ -36,6 +36,7 @@ import type {
   BoardsResponse,
   KanbanBoard,
   KanbanProfile,
+  KanbanProfileRun,
   KanbanProject,
   KanbanTask,
   KanbanTaskDetail,
@@ -380,6 +381,8 @@ export const taskKey = (scope: string, slug: string, id: string) => ['kanban', '
 export const logKey = (scope: string, slug: string, id: string) => ['kanban', 'log', scope, slug, id] as const
 export const boardsKey = (scope: string) => ['kanban', 'boards', scope] as const
 export const profilesKey = (scope: string) => ['kanban', 'profiles', scope] as const
+export const profileRunsKey = (scope: string, profile: string) =>
+  ['kanban', 'profileRuns', scope, profile] as const
 export const projectsKey = (scope: string) => ['kanban', 'projects', scope] as const
 export const orchestrationKey = (scope: string) => ['kanban', 'orchestration', scope] as const
 
@@ -401,6 +404,12 @@ export const fetchLog = (id: string) => call<WorkerLog>(withBoard(`/tasks/${id}/
 export const fetchBoards = () => call<BoardsResponse>('/boards')
 
 export const fetchProfiles = () => call<{ profiles: KanbanProfile[] }>('/profiles')
+
+/** Read-only run history for one profile (desktop Task History view) — every
+ *  `task_runs` row that profile ever produced, most recent first, joined with
+ *  the owning task's title/status. Board-scoped like everything else here. */
+export const fetchProfileRuns = (profile: string) =>
+  call<{ runs: KanbanProfileRun[] }>(withBoard(`/profiles/${encodeURIComponent(profile)}/runs`))
 
 /** First-class Hermes projects, for scoping a board's default workspace. */
 export const fetchProjects = () => call<{ projects: KanbanProject[] }>('/projects')

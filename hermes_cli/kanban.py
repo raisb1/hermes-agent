@@ -19,6 +19,7 @@ from typing import Optional
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_rework as kbr
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
@@ -206,10 +207,10 @@ def _profile_author() -> str:
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
-    "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
+    "claim", "comment", "attach", "attach-rm", "complete", "edit", "set-pr-policy", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "request-review", "request-changes", "reopen-review",
+    "request-review", "request-changes", "reopen-review", "reopen-rework",
     "gc",
 })
 
@@ -515,6 +516,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         field("model", f"{task.model_override}{_prov}")
+    if task.completion_contract and task.completion_contract != "local-only":
+        from hermes_cli.kanban_pr_acceptance import effective_policy
+        try:
+            field("pr-policy", effective_policy(task.pr_acceptance_policy))
+        except ValueError:
+            field("pr-policy", "invalid (completion blocked)")
     # Effective retry threshold (task > config > default) explains auto-blocks.
     if task.max_retries is not None:
         print(f"  max-retries: {task.max_retries} (task)")
@@ -594,6 +601,22 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         print(f"Set model override on {args.task_id}: {label} (applies on next dispatch)")
     else:
         print(f"Cleared model override on {args.task_id} (worker uses its profile default)")
+    return 0
+
+
+def _cmd_set_pr_policy(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_pr_acceptance_store import set_pr_acceptance_policy
+
+    try:
+        with kbc.connect_closing() as conn:
+            ok = set_pr_acceptance_policy(
+                conn, args.task_id, args.policy, reason=args.reason, author=_profile_author(),
+            )
+    except ValueError as exc:
+        return _err(f"kanban: {exc}", 2)
+    if not ok:
+        return _err(f"no such task: {args.task_id}")
+    print(f"Set PR acceptance policy on {args.task_id}: {args.policy}")
     return 0
 
 
@@ -918,9 +941,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 return False
             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
             try:
-                done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
-                                        expected_run_id=_worker_run_id_for(tid),
-                                        force=bool(getattr(args, "force", False)))
+                ok, reason = kb.complete_task(
+                    conn, tid, result=args.result, summary=summary, metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                    force=bool(getattr(args, "force", False)), with_reason=True)
             except kb.LiveClaimError:
                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
                                  f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
@@ -930,15 +954,20 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
                                  f"describing what was done (an empty completion is not evidence).")
                 return False
-            if not done:
-                # complete_task returns bare False for a dependency refusal too;
-                # name the open parents instead of claiming the id is unknown.
+            if not ok:
+                # Name the blocking parents FIRST: complete_task's generic
+                # "parent dependencies are not satisfied" cannot tell a worker WHICH
+                # parent to finish, while unsatisfied_parents() names ids and statuses.
+                # `reason` still wins for every non-parent refusal (review gate, PR
+                # acceptance, empty completion), which parent naming cannot explain.
                 blockers = kb.unsatisfied_parents(conn, tid)
                 if blockers:
                     detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
                     fail_msg[tid] = (f"cannot complete {tid}: unsatisfied parent dependencies: {detail}; "
                                      f"complete the parents first, or `hermes kanban unlink <parent> {tid}`.")
-            return done
+                elif reason:
+                    fail_msg[tid] = reason
+            return ok
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
 
@@ -1085,6 +1114,23 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
 
         return _bulk_apply(ids, op, lambda tid: f"Reopened {tid}{suffix}",
                            lambda tid: f"cannot reopen {tid} (not in review?)")
+
+
+def _cmd_reopen_rework(args: argparse.Namespace) -> int:
+    tid = args.task_id
+    with kbc.connect_closing() as conn:
+        ok, detail = kbr.reopen_task_for_rework(
+            conn,
+            tid,
+            reason=getattr(args, "reason", ""),
+            author=_profile_author(),
+        )
+        if not ok:
+            return _err(f"cannot reopen {tid} for rework: {detail or 'invalid task state'}")
+        task = kb.get_task(conn, tid)
+        status = task.status if task else "ready"
+    print(f"Reopened {tid} for rework; routed to {detail} ({status})")
+    return 0
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:
@@ -1319,7 +1365,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
-    "assign": _cmd_assign, "set-model": _cmd_set_model,
+    "assign": _cmd_assign, "set-model": _cmd_set_model, "set-pr-policy": _cmd_set_pr_policy,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
@@ -1328,7 +1374,7 @@ _HANDLERS = {
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
-    "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
+    "reopen-review": _cmd_reopen_review, "reopen-rework": _cmd_reopen_rework, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,

@@ -32,6 +32,7 @@ import {
 
 import { $boardSlug, bindApi, boardKey, fetchBoard, useKanbanScope } from './api'
 import { KanbanBoardPage } from './board'
+import { TaskHistoryPage } from './history'
 import { KANBAN_LOCALES } from './i18n'
 import { $newTaskLane, useKanban } from './ui'
 
@@ -112,6 +113,12 @@ const plugin: HermesPlugin = {
         render: () => <KanbanBoardPage />
       },
       {
+        id: 'history-page',
+        area: ROUTES_AREA,
+        data: { path: '/kanban-history' } satisfies RouteContribution,
+        render: () => <TaskHistoryPage />
+      },
+      {
         id: 'count',
         area: STATUSBAR_AREAS.right,
         order: 80,
@@ -121,6 +128,16 @@ const plugin: HermesPlugin = {
 
     const registerLabels = () =>
       ctx.registerMany([
+        {
+          id: 'open-history',
+          area: PALETTE_AREA,
+          data: {
+            id: 'kanban.openHistory',
+            label: ctx.i18n.t('historyCommand'),
+            keywords: ['kanban', 'task', 'history', 'runs', 'transcript'],
+            run: () => host.navigate('/kanban-history')
+          } satisfies PaletteContribution
+        },
         {
           id: 'nav',
           area: SIDEBAR_NAV_AREA,

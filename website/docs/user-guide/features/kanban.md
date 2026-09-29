@@ -54,7 +54,29 @@ work; existing and undeclared cards retain that default. Prose URLs are not poli
 
 After publishing, pass `metadata.published_pr` to completion. The first matching
 URL binds the card permanently; retries cannot substitute a green sibling PR.
-CLI `show --json` and `kanban_show` expose the persisted contract.
+CLI `show --json` and `kanban_show` expose the persisted contract and its
+effective PR acceptance policy. The default policy is `required-checks`, for
+new and existing tasks alike. A repository with no discovered required checks
+does not silently become local-only: completion stays nonterminal with an
+actionable `no-required-checks` receipt.
+
+When the task's documented local verification is the authoritative evidence,
+an operator may make that narrow, audited declaration on a nonterminal
+PR-backed task (including a blocked task):
+
+```bash
+hermes kanban --board BOARD set-pr-policy t_abcd \
+  local-if-no-required-checks \
+  --reason "the documented local integration suite is authoritative"
+```
+
+`--reason` is stored with the old/new policy and author in a
+`pr_acceptance_policy_changed` event. Revert with `required-checks` and a
+reason. This policy neither runs arbitrary local commands nor changes the
+immutable PR identity: the first matching published PR URL still binds the
+task permanently. Any discovered classic branch-protection or ruleset check
+remains mandatory under either policy. The independent release-manager merge
+gate is unchanged.
 
 The shared `complete_task` boundary covers worker tools, CLI, review approval and
 dashboard completion. It reads classic branch protection and active ruleset
@@ -63,8 +85,13 @@ re-reads the PR head/base. Optional failed/skipped telemetry does not veto accep
 required checks. Missing, pending, failed, cancelled, timed-out, stale, skipped or
 neutral **required** evidence cannot complete the card. Neither can zero-run
 acceptance, unreadable policy or GitHub API failures. A repository without required
-checks needs a local-only contract. `gh` must be authenticated with read access to
-the repository's checks and rules; no remote writes are performed by this gate.
+checks needs the explicit policy declaration above after local verification is
+documented. `gh` must be authenticated with read access to the repository's
+checks and rules; no remote writes are performed by this gate. GitHub's known
+rules-endpoint plan restriction (HTTP 403 with its exact documented message)
+is recorded as sanitized unavailable-rules evidence, not as proof that no
+rules exist; other API failures still reject completion as infrastructure.
+
 Acceptance reads run as the **assignee profile's** `gh` login — its `GH_TOKEN` /
 `GH_CONFIG_DIR` from the profile's own `.env`, never the ambient login of the
 process completing the card. On multi-profile hosts (one GitHub identity per
@@ -93,6 +120,34 @@ transaction or a continuous post-completion monitor. This is a single-user lifec
 guard, not OS isolation against arbitrary direct database writes. GitHub Enterprise
 is not covered. Related publication/lifecycle work: #91230, #84254, #52311; local
 verification and publication alone are not remote acceptance.
+
+### Same-card review gate for PR work
+
+PR-backed cards retain ordinary completion semantics until they enter the same-card
+review lifecycle. Once a `review_requested` or `changes_requested` handoff is
+recorded, completion is guarded by durable event and run provenance rather than by a
+title, comment, assignee, or GitHub review. The first PR review handoff must name a
+nonblank reviewer profile distinct from the claimed implementer; re-review may reuse
+the reviewer recorded by a valid `changes_requested` handoff. The original
+implementer identity remains immutable across reassignment and rework.
+
+A guarded card may complete only from a currently claimed `review` run whose profile
+matches a fresh `review_requested` handoff and differs from that original
+implementer. `changes_requested` and `rework_requested` invalidate prior approval;
+a repaired card must request review again and a distinct reviewer must claim and
+approve the new handoff. A review retry after an audited block, unblock, reclaim, or
+reclaim-by-dispatch remains a review run and can approve its still-current handoff.
+
+This check runs before PR-acceptance collection and again in the terminal SQLite
+transaction before receipts, state changes, artifacts, workspace cleanup, or child
+promotion. Failed approval attempts leave the task, current run, result, and
+descendants unchanged. CLI, tool, and dashboard completion all use the same boundary.
+For operator recovery, use the audited request-review, reopen-review, or
+reopen-rework transitions to restore a valid handoff; a run-id-less manual completion
+is never an approval bypass. Cards without a PR contract, and PR cards that have not
+entered same-card review, keep their existing completion behavior. Missing or
+malformed provenance in a recorded PR review lifecycle fails closed with instructions
+to request a fresh same-card review.
 
 ## Kanban vs. `delegate_task`
 
@@ -463,7 +518,7 @@ Dispatcher-owned workers receive their task lifecycle tools automatically.
 | `kanban_show` | Read the current task (title, body, prior attempts, parent handoffs, comments, full pre-formatted `worker_context`). Defaults to the env's task id. | — |
 | `kanban_list` | List task summaries with filters for `assignee`, `status`, `tenant`, archived visibility, and limit. Intended for orchestrators discovering board work. | — |
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
-| `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
+| `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and reviewer profile. The task moves to `review`; this is not a block. PR-backed tasks require a nonblank reviewer distinct from the durable implementer; legacy local-only tasks keep the optional reviewer behavior. | `summary` (plus `reviewer` for PR-backed tasks) |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes when an incomplete parent finishes; with no open parent it is recorded as `needs_input` instead, since the wait could never be satisfied), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
@@ -976,6 +1031,7 @@ hermes kanban archive <id>...
 hermes kanban request-review <id> [--summary "..."] [--metadata JSON] [--reviewer PROFILE]
 hermes kanban request-changes <id> "<required changes>"               # active reviewer -> implementer
 hermes kanban reopen-review  <id>... [--reason "..."]                 # changes requested: 'review' -> ready/todo
+hermes kanban reopen-rework  <id> --reason "<required changes>"        # done implementation -> original coder
 
 hermes kanban tail <id>                                # follow a single task's event stream
 hermes kanban watch [--assignee P] [--tenant T]        # live stream ALL events to the terminal
@@ -1003,6 +1059,28 @@ hermes kanban gc [--event-retention-days N]            # workspaces + old events
 ```
 
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
+
+### Reopening an approved implementation for rework
+
+`reopen-rework` is the audited recovery path for a completed implementation whose
+original PR needs additional same-card work. It accepts exactly one `done` task,
+recovers the original coder only from its latest durable review handoff, restores
+that coder to `ready` (or `todo` while a parent is unfinished), and invalidates
+downstream QA/release work in the same database transaction. It records the
+redacted reason, operator, restored coder, and landing status as an event and
+comment; any active invalidated descendant worker is reclaimed only after that
+audit is committed.
+
+Python callers can use
+`hermes_cli.kanban_db_rework.reopen_task_for_rework(conn, task_id, *, reason, author)`;
+it returns `(True, implementer)` on success or `(False, actionable_reason)` when
+the task cannot be reopened.
+
+Before using it, the operator or triage caller must verify that the original PR is
+still open and its preserved worktree and branch are valid. The command does not
+perform GitHub or filesystem checks, create a branch or task, merge/deploy, or
+approve review. After the coder's rework, the card must go through same-card
+review again.
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
 

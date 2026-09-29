@@ -738,6 +738,7 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    pr_acceptance_policy: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -767,7 +768,7 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "session_id", "completion_contract", "pr_acceptance_policy",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -796,6 +797,7 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    worker_session_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -804,6 +806,7 @@ class Run:
                 col: _lossy_text(row[col]) for col in (
                     "task_id", "profile", "step_key", "status", "claim_lock", "claim_expires",
                     "worker_pid", "max_runtime_seconds", "last_heartbeat_at", "outcome", "summary", "error",
+                    "worker_session_id",
                 )
             },
             id=int(row["id"]),
@@ -1028,7 +1031,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    worker_session_id   TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2732,8 +2736,8 @@ def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
-    fire_lifecycle_hook: bool = True, force: bool = False,
-) -> bool:
+    fire_lifecycle_hook: bool = True, force: bool = False, with_reason: bool = False,
+) -> Any:
     """``running|ready|blocked|review -> done``; records ``result``.
 
     ``ready`` is accepted for manual CLI completion, ``review`` for human
@@ -2751,11 +2755,17 @@ def complete_task(
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
     """
+    def _ret(ok: bool, reason: Optional[str] = None):
+        return (ok, reason) if with_reason else ok
+
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
-        return False
+        return _ret(False, "parent dependencies are not satisfied")
+    from hermes_cli.kanban_db_review_gate import completion_gate_reason
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
+    if review_reason := completion_gate_reason(conn, task_id, expected_run_id=expected_run_id):
+        return _ret(False, review_reason)
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
     metadata = _merge_completion_prose_artifacts(
@@ -2764,14 +2774,18 @@ def complete_task(
     handoff_summary = summary if summary is not None else result
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
-        return False
+        return _ret(False, "PR acceptance requirements are not satisfied")
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
-            return False
+            return _ret(False, "parent dependencies are not satisfied")
+        # Acceptance collection performs network I/O outside the write lock.
+        # Recheck before receipts, state, runs, artifacts, or child promotion.
+        if review_reason := completion_gate_reason(conn, task_id, expected_run_id=expected_run_id):
+            return _ret(False, review_reason)
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
-            return False
+            return _ret(False, "PR acceptance changed or is no longer valid")
         trow = conn.execute(
             "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
             (task_id,),
@@ -2800,7 +2814,7 @@ def complete_task(
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
         if conn.execute(sql, params).rowcount != 1:
-            return False
+            return _ret(False, "task is not completable from its current status or run")
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
         run_id = _end_run(
@@ -2832,7 +2846,7 @@ def complete_task(
     _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
         _fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)
-    return True
+    return _ret(True)
 
 
 _REVIEW_APPROVED_NOTE = "Review approved without additional evidence."
@@ -3393,7 +3407,7 @@ def request_review(
                 return _ret(False, "parent dependencies are not satisfied")
             trow = conn.execute(
                 "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
-                "worker_started_at FROM tasks WHERE id = ?", (task_id,),
+                "worker_started_at, completion_contract FROM tasks WHERE id = ?", (task_id,),
             ).fetchone()
             if trow is None:
                 return _ret(False, "task not found")
@@ -3432,6 +3446,21 @@ def request_review(
                 implementer = arow["profile"] if arow else None
             if implementer is None and trow["assignee"] != reviewer:
                 implementer = trow["assignee"]
+            # A PR-backed card additionally demands immutable implementer
+            # provenance and a reviewer distinct from both the original
+            # implementer and the acting run; non-PR cards keep the legacy
+            # optional-reviewer behaviour (kanban_db_review_gate).
+            from hermes_cli.kanban_db_review_gate import review_request_provenance
+            durable_implementer, reviewer, provenance_reason = review_request_provenance(
+                conn,
+                task_id,
+                contract=trow["completion_contract"],
+                current_run_id=trow["current_run_id"],
+                reviewer=reviewer,
+            )
+            if provenance_reason is not None:
+                return _ret(False, provenance_reason)
+            implementer = durable_implementer or implementer
             assignee_sql = ", assignee = ?" if reviewer is not None else ""
             run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
             params: tuple[Any, ...] = (

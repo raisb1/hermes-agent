@@ -831,6 +831,8 @@ _LATER_TASK_COLUMNS = (
     ("goal_mode", "goal_mode INTEGER NOT NULL DEFAULT 0"),
     ("goal_max_turns", "goal_max_turns INTEGER"),
     ("completion_contract", "completion_contract TEXT"),
+    # NULL preserves the strict required-checks policy for every existing task.
+    ("pr_acceptance_policy", "pr_acceptance_policy TEXT"),
     ("session_id", "session_id TEXT"),
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
@@ -855,7 +857,12 @@ _TASK_RUN_COLUMNS = (
     # Spawn-time start fingerprint of the run's worker_pid (PID-reuse guard for the
     # terminal-worker reaper; NULL = legacy row, never signalled).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Session id of the worker that owned this run, for the read-only desktop
+    # Task History view (NULL = legacy row or no session recorded).
+    ("worker_session_id", "worker_session_id TEXT"),
 )
+
+
 
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
