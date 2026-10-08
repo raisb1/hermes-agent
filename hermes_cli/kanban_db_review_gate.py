@@ -50,6 +50,9 @@ def _durable_implementer(conn: sqlite3.Connection, task_id: str) -> tuple[Option
     """Return the immutable original implementer, or a fail-closed reason."""
     events = _review_events(conn, task_id)
     if not events:
+        # No handoff is valid during a first PR review request.  Reopen callers
+        # use the public strict wrapper below, which rejects this state before
+        # it could restore a reviewer as the implementer.
         return None, None
     first = _payload(events[0])
     implementer = _profile(first.get("implementer")) if first is not None else None
@@ -60,7 +63,10 @@ def _durable_implementer(conn: sqlite3.Connection, task_id: str) -> tuple[Option
 
 def durable_implementer(conn: sqlite3.Connection, task_id: str) -> tuple[Optional[str], Optional[str]]:
     """Public, fail-closed lookup for original PR implementation ownership."""
-    return _durable_implementer(conn, task_id)
+    implementer, reason = _durable_implementer(conn, task_id)
+    if implementer is None and reason is None:
+        return None, "recorded review lifecycle has no durable implementer provenance"
+    return implementer, reason
 
 
 def _active_run_profile(conn: sqlite3.Connection, task_id: str, run_id: Optional[int]) -> Optional[str]:

@@ -161,21 +161,13 @@ def recover_upstream_rework(
         ).fetchone()
         if task is None:
             return False, "task not found"
-        if task["status"] == "todo":
-            prior = conn.execute(
-                "SELECT payload FROM task_events WHERE task_id = ? "
-                "AND kind = 'upstream_rework_recovered' ORDER BY id DESC LIMIT 1",
-                (task_id,),
-            ).fetchone()
-            if prior is not None:
-                try:
-                    if json.loads(prior["payload"] or "{}").get("ancestor") == upstream_task_id:
-                        return True, "already recovered"
-                except (TypeError, ValueError):
-                    pass
-        if task["status"] not in {"blocked", "triage"}:
-            return False, "task must be blocked or triage"
         if any(task[key] is not None for key in ("claim_lock", "claim_expires", "worker_pid", "current_run_id")):
+            return False, "task has a conflicting live run or claim"
+        open_run = conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ? AND ended_at IS NULL LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if open_run is not None:
             return False, "task has a conflicting live run or claim"
         upstream = conn.execute("SELECT status FROM tasks WHERE id = ?", (upstream_task_id,)).fetchone()
         if upstream is None:
@@ -197,6 +189,23 @@ def recover_upstream_rework(
             return False, "upstream_task_id must name a real transitive ancestor of this task"
         if upstream["status"] in {"done", "archived"}:
             return False, "upstream task is already satisfied"
+        # Idempotency is only valid while the same real, incomplete ancestor
+        # still gates this task.  Historical recovery events are audit history,
+        # not a perpetual bypass of present graph/claim validation.
+        if task["status"] == "todo":
+            prior = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'upstream_rework_recovered' ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if prior is not None:
+                try:
+                    if json.loads(prior["payload"] or "{}").get("ancestor") == upstream_task_id:
+                        return True, "already recovered"
+                except (TypeError, ValueError):
+                    pass
+        if task["status"] not in {"blocked", "triage"}:
+            return False, "task must be blocked or triage"
         updated = conn.execute(
             """
             UPDATE tasks

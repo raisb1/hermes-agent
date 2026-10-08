@@ -1031,9 +1031,18 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
             return f"Blocked {tid}{suffix}"
 
-        op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, cause_key=cause_key,
-            upstream_task_id=upstream_task_id, expected_run_id=_worker_run_id_for(tid)))
+        # Validate and persist the domain transition before recording the
+        # operator's prose.  In particular, an invalid typed identity must not
+        # leave a durable ``BLOCKED: ...`` comment on an otherwise unchanged
+        # task.
+        def op(tid):
+            blocked = kb.block_task(
+                conn, tid, reason=reason, kind=kind, cause_key=cause_key,
+                upstream_task_id=upstream_task_id, expected_run_id=_worker_run_id_for(tid),
+            )
+            if blocked and reason:
+                kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
+            return blocked
         return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
 
 

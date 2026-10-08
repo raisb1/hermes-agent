@@ -3905,7 +3905,7 @@ def invalidate_descendants_for_parent_reopen(
             )
             SELECT t.id, t.status, t.assignee, t.completion_contract,
                    t.block_upstream_task_id, t.current_run_id, t.worker_pid,
-                   t.claim_lock, t.worker_started_at
+                   t.claim_lock, t.claim_expires, t.worker_started_at
             FROM descendants d
             JOIN tasks t ON t.id = d.id
             ORDER BY t.id
@@ -3922,6 +3922,23 @@ def invalidate_descendants_for_parent_reopen(
                 previous_status in {"blocked", "triage"}
                 and row["block_upstream_task_id"] == task_id
             ):
+                # A malformed persisted blocked/triage card can still retain a
+                # live claim or an unclosed run.  Never clear its run pointer
+                # without ending the run and post-commit reaping its exact PID
+                # fingerprint; retaining the typed wait is safer than silently
+                # stranding that worker.
+                open_run = conn.execute(
+                    "SELECT 1 FROM task_runs WHERE task_id = ? AND ended_at IS NULL LIMIT 1",
+                    (row["id"],),
+                ).fetchone()
+                if (
+                    row["claim_lock"] is not None
+                    or row["claim_expires"] is not None
+                    or row["worker_pid"] is not None
+                    or row["current_run_id"] is not None
+                    or open_run is not None
+                ):
+                    continue
                 conn.execute(
                     "UPDATE tasks SET status = 'todo', claim_lock = NULL, claim_expires = NULL, "
                     "worker_pid = NULL, worker_started_at = NULL, current_run_id = NULL, "
