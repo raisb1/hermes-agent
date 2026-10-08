@@ -210,7 +210,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "set-pr-policy", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "request-review", "request-changes", "reopen-review", "reopen-rework",
+    "request-review", "request-changes", "reopen-review", "reopen-rework", "recover-upstream-rework",
     "gc",
 })
 
@@ -1010,6 +1010,8 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     kind = getattr(args, "kind", None)
+    cause_key = getattr(args, "cause_key", None)
+    upstream_task_id = getattr(args, "upstream_task_id", None)
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
@@ -1029,8 +1031,18 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
             return f"Blocked {tid}{suffix}"
 
-        op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
+        # Validate and persist the domain transition before recording the
+        # operator's prose.  In particular, an invalid typed identity must not
+        # leave a durable ``BLOCKED: ...`` comment on an otherwise unchanged
+        # task.
+        def op(tid):
+            blocked = kb.block_task(
+                conn, tid, reason=reason, kind=kind, cause_key=cause_key,
+                upstream_task_id=upstream_task_id, expected_run_id=_worker_run_id_for(tid),
+            )
+            if blocked and reason:
+                kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
+            return blocked
         return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
 
 
@@ -1130,6 +1142,19 @@ def _cmd_reopen_rework(args: argparse.Namespace) -> int:
         task = kb.get_task(conn, tid)
         status = task.status if task else "ready"
     print(f"Reopened {tid} for rework; routed to {detail} ({status})")
+    return 0
+
+
+def _cmd_recover_upstream_rework(args: argparse.Namespace) -> int:
+    tid = args.task_id
+    with kbc.connect_closing() as conn:
+        ok, detail = kbr.recover_upstream_rework(
+            conn, tid, upstream_task_id=args.upstream_task_id, reason=args.reason,
+            author=_profile_author(),
+        )
+    if not ok:
+        return _err(f"cannot recover {tid} for upstream rework: {detail}")
+    print(f"Recovered {tid} for upstream rework; routed to {detail}")
     return 0
 
 
@@ -1374,7 +1399,8 @@ _HANDLERS = {
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
-    "reopen-review": _cmd_reopen_review, "reopen-rework": _cmd_reopen_rework, "promote": _cmd_promote,
+    "reopen-review": _cmd_reopen_review, "reopen-rework": _cmd_reopen_rework,
+    "recover-upstream-rework": _cmd_recover_upstream_rework, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,

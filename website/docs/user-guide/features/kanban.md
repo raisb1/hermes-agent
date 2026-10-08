@@ -1024,7 +1024,7 @@ hermes kanban comment <id> "<text>" [--author NAME]
 
 # Bulk verbs — accept multiple ids:
 hermes kanban complete <id>... [--result "..."] [--force]
-hermes kanban block <id> "<reason>" [--ids <id>...]
+hermes kanban block <id> "<reason>" [--ids <id>...] [--cause-key KEY] [--upstream-task-id <ancestor-id>]
 hermes kanban unblock <id>...
 hermes kanban archive <id>...
 
@@ -1032,6 +1032,7 @@ hermes kanban request-review <id> [--summary "..."] [--metadata JSON] [--reviewe
 hermes kanban request-changes <id> "<required changes>"               # active reviewer -> implementer
 hermes kanban reopen-review  <id>... [--reason "..."]                 # changes requested: 'review' -> ready/todo
 hermes kanban reopen-rework  <id> --reason "<required changes>"        # done implementation -> original coder
+hermes kanban recover-upstream-rework <id> --upstream-task-id <ancestor-id> --reason "<why>"
 
 hermes kanban tail <id>                                # follow a single task's event stream
 hermes kanban watch [--assignee P] [--tenant T]        # live stream ALL events to the terminal
@@ -1083,6 +1084,29 @@ approve review. After the coder's rework, the card must go through same-card
 review again.
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
+
+### Upstream rework waits
+
+Use `reopen-rework` first when reopening a completed implementation. Downstream
+PR-backed implementation cards are returned to the durable original implementer
+and need a fresh same-card review; QA and release cards keep their stage owner.
+
+For a blocker that is solely caused by a specific upstream implementation defect,
+workers can record a stable `--cause-key` and `--upstream-task-id`. The upstream
+id must already be a real transitive parent, `--cause-key` is required, and the
+kind must be `dependency` or `needs_input`; this never creates a graph edge.
+When that exact ancestor is reopened, only blocked/triaged cards carrying that
+current typed marker return to `todo` for normal parent gating. Ordinary human
+triage, legacy rows, prose mentions, and markers for another ancestor remain
+untouched. Recurrence identity is the exact `(kind, cause_key, upstream_task_id)`
+tuple, so distinct causes do not consume each other's retry budget.
+
+Older stalled rows have no typed provenance and are intentionally not guessed
+from their reason text. After reopening the incomplete implementation, an
+operator can explicitly run `recover-upstream-rework` with the real ancestor and
+a reason. It only accepts unclaimed blocked/triage cards, preserves the assigned
+stage owner, clears scoped stale recovery state, and audits the transition to
+`todo`; repeated recovery is idempotent.
 
 ### Concurrency, scheduling, and child promotion config
 

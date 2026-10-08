@@ -476,6 +476,30 @@ def test_block_dependency_without_open_parent_is_rekinded(worker_env):
     assert "no parent is open" in d["note"]
 
 
+def test_block_tool_persists_typed_upstream_identity(worker_env):
+    """The gated worker tool forwards typed provenance to the shared domain API."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    conn = kbc.connect()
+    try:
+        parent = kb.create_task(conn, title="upstream", assignee="coder")
+        # This fixture's task is already claimed.  The graph write is only test
+        # setup; block_task must validate the actual transitive parent itself.
+        conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (parent, worker_env))
+        conn.commit()
+    finally:
+        conn.close()
+
+    d = json.loads(kt._handle_block({
+        "reason": "waiting on upstream rework", "kind": "dependency",
+        "cause_key": "upstream.contract", "upstream_task_id": parent,
+    }))
+    assert (d["ok"], d["status"], d["block_kind"]) == (True, "todo", "dependency")
+    assert (d["cause_key"], d["upstream_task_id"]) == ("upstream.contract", parent)
+
+
 def test_heartbeat_extends_claim_expires(worker_env):
     """The kanban_heartbeat tool MUST extend claim_expires, not just
     update last_heartbeat_at — otherwise long-running workers loop the

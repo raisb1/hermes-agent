@@ -195,6 +195,16 @@ KANBAN_BLOCK_SCHEMA = _schema(
                 "The others surface to a human. Omit only if none apply."
             ),
         },
+        "cause_key": _prop("string", (
+            "Optional stable machine identifier for this blocker (1-128 ASCII "
+            "letters/digits plus . _ : -). Recurrence counting compares kind, "
+            "cause_key, and upstream_task_id exactly; omit to retain legacy behavior."
+        )),
+        "upstream_task_id": _prop("string", (
+            "Optional explicit transitive parent whose implementation defect is "
+            "the sole blocker. Requires a nonblank cause_key and kind dependency "
+            "or needs_input; never creates a dependency edge."
+        )),
     },
     ["reason"],
 )
