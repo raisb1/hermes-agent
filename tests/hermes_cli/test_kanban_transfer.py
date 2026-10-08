@@ -243,6 +243,7 @@ def test_unresolvable_workspaces_are_parked_not_dispatched(kanban_root, tmp_path
 def test_board_metadata_loses_exporter_local_paths(kanban_root, tmp_path):
     kb.create_board("alpha", name="Alpha Board",
                     default_workdir="/exporter/repo", project_id="proj-1")
+    kb.write_board_metadata("alpha", pr_acceptance_policy="local-if-no-required-checks")
     archive = kt.export_board("alpha", str(tmp_path / "alpha"))["archive"]
 
     kanban_root("target")
@@ -252,6 +253,7 @@ def test_board_metadata_loses_exporter_local_paths(kanban_root, tmp_path):
     assert meta["name"] == "Alpha Board"
     assert meta["default_workdir"] is None
     assert meta["project_id"] is None
+    assert meta["pr_acceptance_policy"] is None
 
 
 # ---------------------------------------------------------------------------
