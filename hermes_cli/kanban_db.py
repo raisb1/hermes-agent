@@ -562,6 +562,9 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "default_workdir": None,
         # Project scope: new tasks inherit it (deterministic worktree + branch).
         "project_id": None,
+        # Board default PR acceptance policy, stamped onto new PR-backed tasks
+        # (None = per-task default, i.e. strict ``required-checks``).
+        "pr_acceptance_policy": None,
         "created_at": None,
         "archived": False,
     }
@@ -584,11 +587,18 @@ def write_board_metadata(
     board: Optional[str], *, name: Optional[str] = None, description: Optional[str] = None,
     icon: Optional[str] = None, color: Optional[str] = None, archived: Optional[bool] = None,
     default_workdir: Optional[str] = None, project_id: Optional[str] = None,
+    pr_acceptance_policy: Optional[str] = None,
 ) -> dict:
     """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
-    set on first write. ``project_id``/``default_workdir``: ``None`` = unchanged,
-    "" = clear (``project_id`` is not validated here)."""
+    set on first write. ``project_id``/``default_workdir``/``pr_acceptance_policy``:
+    ``None`` = unchanged, "" = clear (``project_id`` is not validated here)."""
     _assert_not_delegated_child_mutation()
+    if pr_acceptance_policy:
+        from hermes_cli.kanban_pr_acceptance import VALID_PR_ACCEPTANCE_POLICIES
+
+        if pr_acceptance_policy not in VALID_PR_ACCEPTANCE_POLICIES:
+            raise ValueError(
+                f"pr acceptance policy must be one of {sorted(VALID_PR_ACCEPTANCE_POLICIES)}")
     slug = _slug_or_default(board)
     meta = read_board_metadata(slug)
     # db_path is derived on every read; never persist it into board.json.
@@ -600,7 +610,8 @@ def write_board_metadata(
             meta[key] = str(value)
     if archived is not None:
         meta["archived"] = bool(archived)
-    for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):
+    for key, value in (("default_workdir", default_workdir), ("project_id", project_id),
+                       ("pr_acceptance_policy", pr_acceptance_policy)):
         if value is not None:
             meta[key] = str(value) if value else None
     if not meta.get("created_at"):
@@ -1290,6 +1301,20 @@ def create_task(
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
     completion_contract = validate_contract(completion_contract)
+    # A board-level PR policy (``boards set-pr-policy``) is stamped onto every
+    # new PR-backed task, so cards created by workers/architects inherit it
+    # without each surface repeating ``set-pr-policy``. Unknown values in a
+    # hand-edited board.json are ignored (task falls back to strict default).
+    pr_acceptance_policy = None
+    if completion_contract != "local-only":
+        try:
+            from hermes_cli.kanban_pr_acceptance import VALID_PR_ACCEPTANCE_POLICIES
+
+            board_policy = _board_meta_for(board).get("pr_acceptance_policy")
+            if board_policy in VALID_PR_ACCEPTANCE_POLICIES:
+                pr_acceptance_policy = board_policy
+        except Exception:
+            pr_acceptance_policy = None
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
@@ -1369,8 +1394,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        pr_acceptance_policy
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1380,6 +1406,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        pr_acceptance_policy,
                     ),
                 )
                 for pid in parents:
@@ -1404,6 +1431,13 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if pr_acceptance_policy is not None:
+                    # Same audit trail as an explicit ``set-pr-policy``.
+                    _append_event(conn, task_id, "pr_acceptance_policy_changed", {
+                        "old_policy": None, "new_policy": pr_acceptance_policy,
+                        "author": created_by or "board-default",
+                        "reason": "inherited board default (boards set-pr-policy)",
+                    })
                 if task_status == "blocked":
                     _append_event(
                         conn,

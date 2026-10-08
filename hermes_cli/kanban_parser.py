@@ -122,6 +122,18 @@ _BOARD_SPECS = [
         _SLUG,
         _arg("path", nargs="?", help="Absolute path to use as default workdir. Omit to clear."),
     ], help="Set the default workspace path for tasks on a board"),
+    _cmd("set-pr-policy", [
+        _SLUG,
+        _arg("policy", nargs="?", choices=("required-checks", "local-if-no-required-checks"),
+             help="PR acceptance policy stamped onto new PR-backed tasks. Omit to clear."),
+    ], help="Set the default PR acceptance policy inherited by new PR-backed tasks on a board",
+       description=(
+        "New PR-backed tasks created on this board inherit the policy (an audited "
+        "pr_acceptance_policy_changed event is recorded). Existing tasks are unchanged; "
+        "use `hermes kanban set-pr-policy TASK_ID ...` for those. Use "
+        "local-if-no-required-checks only for repos whose GitHub plan has no required "
+        "checks and whose declared local verification is authoritative."
+    )),
     _cmd("export", [
         _arg("slug", nargs="?", help="Board to export (default: the current board)"),
         _arg("-o", "--output", help="Archive path (default: ./<slug>.tar.gz)"),

@@ -474,6 +474,53 @@ def test_cli_policy_round_trip_keeps_blocked_exact_pr_identity(github):
     assert task is not None
     assert task.status == "blocked"
     assert task.completion_contract == contract
+# --- Board-level default PR acceptance policy ---
+
+@pytest.mark.platforms("posix")
+def test_board_pr_policy_is_inherited_by_new_pr_backed_tasks_only(github):
+    """A private repo without required checks opts in once per board, not once per card."""
+    contract = "acme/repo"
+    with connect() as conn:
+        before = kb.create_task(conn, title="before", completion_contract=contract)
+    assert "default PR acceptance policy set" in kc.run_slash(
+        "boards set-pr-policy default local-if-no-required-checks")
+    assert kb.read_board_metadata("default")["pr_acceptance_policy"] == "local-if-no-required-checks"
+    with connect() as conn:
+        pr_task = kb.create_task(conn, title="pr", completion_contract=contract, created_by="architect")
+        local = kb.create_task(conn, title="local")
+        events = [json.loads(row[0]) for row in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance_policy_changed'", (pr_task,))]
+        assert _task(conn, before).pr_acceptance_policy is None
+        assert _task(conn, pr_task).pr_acceptance_policy == "local-if-no-required-checks"
+        assert _task(conn, local).pr_acceptance_policy is None
+    assert events == [{"old_policy": None, "new_policy": "local-if-no-required-checks",
+                       "author": "architect", "reason": "inherited board default (boards set-pr-policy)"}]
+
+    # An explicit per-task choice still overrides the inherited one.
+    assert "Set PR acceptance policy" in kc.run_slash(
+        f'set-pr-policy {pr_task} required-checks --reason "this repo gained CI"')
+    with connect() as conn:
+        assert _task(conn, pr_task).pr_acceptance_policy == "required-checks"
+
+    assert "cleared" in kc.run_slash("boards set-pr-policy default")
+    with connect() as conn:
+        after = kb.create_task(conn, title="after", completion_contract=contract)
+        assert _task(conn, after).pr_acceptance_policy is None
+
+
+@pytest.mark.platforms("posix")
+def test_board_pr_policy_rejects_unknown_and_ignores_hand_edited_garbage(github):
+    with pytest.raises(ValueError):
+        kb.write_board_metadata("default", pr_acceptance_policy="anything-goes")
+    path = kb.board_metadata_path("default")
+    meta = json.loads(path.read_text()) if path.exists() else {}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({**meta, "pr_acceptance_policy": "anything-goes"}))
+    with connect() as conn:
+        tid = kb.create_task(conn, title="pr", completion_contract="acme/repo")
+        assert _task(conn, tid).pr_acceptance_policy is None
+
+
 # --- #122689: acceptance must read the repo as the ASSIGNEE profile's gh login ---
 
 @pytest.mark.platforms("posix")

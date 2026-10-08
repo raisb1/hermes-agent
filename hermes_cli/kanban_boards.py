@@ -129,6 +129,8 @@ def _cmd_boards_show(args: argparse.Namespace) -> int:
     print(f"Current board: {current}\n  Display name: {meta.get('name', '')}")
     if meta.get("description"):
         print(f"  Description:  {meta['description']}")
+    if meta.get("pr_acceptance_policy"):
+        print(f"  PR policy:    {meta['pr_acceptance_policy']} (default for new PR-backed tasks)")
     print(f"  DB path:      {meta['db_path']}\n"
           f"  Tasks:        {sum(counts.values())} total" + (f" ({_fmt_counts(counts)})" if counts else ""))
     return 0
@@ -152,6 +154,23 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
         print(f"Board {normed!r} default workdir set to {new_val!r}.")
     else:
         print(f"Board {normed!r} default workdir cleared.")
+    return 0
+
+
+def _cmd_boards_set_pr_policy(args: argparse.Namespace) -> int:
+    normed, rc = _board_slug_arg(args, "set-pr-policy", must_exist=True)
+    if rc:
+        return rc
+    try:
+        new_val = kb.write_board_metadata(normed, pr_acceptance_policy=args.policy or "").get(
+            "pr_acceptance_policy")
+    except ValueError as exc:
+        return _err(f"kanban boards set-pr-policy: {exc}", 2)
+    if new_val:
+        print(f"Board {normed!r} default PR acceptance policy set to {new_val!r} "
+              "(applies to PR-backed tasks created from now on).")
+    else:
+        print(f"Board {normed!r} default PR acceptance policy cleared (new tasks use required-checks).")
     return 0
 
 
@@ -209,6 +228,7 @@ _BOARD_HANDLERS = {
     "show": _cmd_boards_show, "current": _cmd_boards_show,
     "rename": _cmd_boards_rename,
     "set-default-workdir": _cmd_boards_set_default_workdir,
+    "set-pr-policy": _cmd_boards_set_pr_policy,
     "export": _cmd_boards_export,
     "import": _cmd_boards_import,
 }
