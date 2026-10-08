@@ -16,6 +16,7 @@ moves ``done -> ready/todo`` and re-gates the whole subtree.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from typing import Optional
@@ -23,16 +24,13 @@ from typing import Optional
 from hermes_cli.kanban_db import (
     _append_event,
     _insert_comment,
-    _json_dict,
-    _latest_event,
     _landing_status_after_parents,
-    _nonblank_str,
-    _row_get,
     _terminate_reclaimed_worker,
     invalidate_descendants_for_parent_reopen,
     redact_review_value,
 )
 from hermes_cli.kanban_db_connect import write_txn
+from hermes_cli.kanban_db_review_gate import durable_implementer
 
 
 def reopen_task_for_rework(
@@ -80,10 +78,7 @@ def reopen_task_for_rework(
         ):
             return False, "task has a conflicting live run or claim"
 
-        review_event = _latest_event(conn, task_id, "review_requested")
-        implementer = _nonblank_str(
-            _json_dict(_row_get(review_event, "payload")).get("implementer"),
-        )
+        implementer, _provenance_error = durable_implementer(conn, task_id)
         if implementer is None:
             return False, "review handoff has no valid implementer provenance"
 
@@ -103,7 +98,9 @@ def reopen_task_for_rework(
                    consecutive_failures = 0,
                    last_failure_error = NULL,
                    block_kind = NULL,
-                   block_recurrences = 0
+                   block_recurrences = 0,
+                   block_cause_key = NULL,
+                   block_upstream_task_id = NULL
              WHERE id = ? AND status = 'done'
             """,
             (landing_status, implementer, task_id),
@@ -134,3 +131,93 @@ def reopen_task_for_rework(
     for worker_pid, claim_lock, started_at in terminations:
         _terminate_reclaimed_worker(worker_pid, claim_lock, started_at=started_at)
     return True, implementer
+
+
+def recover_upstream_rework(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    upstream_task_id: str,
+    reason: str,
+    author: str,
+) -> tuple[bool, str]:
+    """Explicitly redrive one legacy upstream-rework wait into ``todo``.
+
+    This deliberately does not mine old prose for a likely ancestor.  The
+    operator names a real *incomplete* transitive parent and the state/audit
+    transition is one transaction, preserving the task's stage owner.
+    """
+    reason = str(redact_review_value(reason or "")).strip()
+    if not reason:
+        return False, "reason is required"
+    upstream_task_id = str(upstream_task_id or "").strip()
+    if not upstream_task_id:
+        return False, "upstream_task_id is required"
+    author = str(author or "").strip() or "operator"
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status, claim_lock, claim_expires, worker_pid, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            return False, "task not found"
+        if task["status"] == "todo":
+            prior = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'upstream_rework_recovered' ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if prior is not None:
+                try:
+                    if json.loads(prior["payload"] or "{}").get("ancestor") == upstream_task_id:
+                        return True, "already recovered"
+                except (TypeError, ValueError):
+                    pass
+        if task["status"] not in {"blocked", "triage"}:
+            return False, "task must be blocked or triage"
+        if any(task[key] is not None for key in ("claim_lock", "claim_expires", "worker_pid", "current_run_id")):
+            return False, "task has a conflicting live run or claim"
+        upstream = conn.execute("SELECT status FROM tasks WHERE id = ?", (upstream_task_id,)).fetchone()
+        if upstream is None:
+            return False, "upstream task not found"
+        if upstream_task_id == task_id:
+            return False, "upstream_task_id must not be the task itself"
+        ancestor = conn.execute(
+            """
+            WITH RECURSIVE ancestors(id) AS (
+                SELECT parent_id FROM task_links WHERE child_id = ?
+                UNION
+                SELECT l.parent_id FROM task_links l JOIN ancestors a ON a.id = l.child_id
+            )
+            SELECT 1 FROM ancestors WHERE id = ? LIMIT 1
+            """,
+            (task_id, upstream_task_id),
+        ).fetchone()
+        if ancestor is None:
+            return False, "upstream_task_id must name a real transitive ancestor of this task"
+        if upstream["status"] in {"done", "archived"}:
+            return False, "upstream task is already satisfied"
+        updated = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'todo', claim_lock = NULL, claim_expires = NULL,
+                   worker_pid = NULL, worker_started_at = NULL, current_run_id = NULL,
+                   consecutive_failures = 0, last_failure_error = NULL,
+                   block_kind = NULL, block_recurrences = 0,
+                   block_cause_key = NULL, block_upstream_task_id = NULL
+             WHERE id = ? AND status IN ('blocked', 'triage')
+            """,
+            (task_id,),
+        )
+        if updated.rowcount != 1:
+            return False, "task changed during recovery"
+        payload = {
+            "ancestor": upstream_task_id, "reason": reason, "author": author,
+            "prior_status": task["status"], "status": "todo", "operator_recovery": True,
+        }
+        _append_event(conn, task_id, "upstream_rework_recovered", payload)
+        _insert_comment(
+            conn, task_id, author,
+            f"Recovered legacy upstream rework wait on {upstream_task_id}: {reason}", int(time.time()),
+        )
+    return True, "todo"

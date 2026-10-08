@@ -105,6 +105,7 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+_BLOCK_CAUSE_KEY = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
 
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
@@ -748,6 +749,8 @@ class Task:
     # VALID_BLOCK_KINDS or None (legacy); kept across unblock so a same-kind re-block reads as a loop.
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
+    block_cause_key: Optional[str] = None
+    block_upstream_task_id: Optional[str] = None
     completion_contract: Optional[str] = None
     pr_acceptance_policy: Optional[str] = None
 
@@ -780,6 +783,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract", "pr_acceptance_policy",
+    "block_cause_key", "block_upstream_task_id",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -986,7 +990,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Stable machine cause and explicit upstream task provenance for block
+    -- recurrence/recovery. NULL means legacy kind-only behavior.
+    block_cause_key      TEXT,
+    block_upstream_task_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2257,6 +2265,49 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
     return [(row["id"], row["status"]) for row in rows]
 
 
+def _validate_block_identity(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    kind: Optional[str],
+    cause_key: Optional[str],
+    upstream_task_id: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    """Validate explicit block provenance without ever changing the graph.
+
+    ``None`` deliberately remains the legacy identity.  A caller that omits an
+    identity on a later block gets ``NULL`` values, rather than inheriting a
+    prior upstream marker from the task row.
+    """
+    if cause_key is not None:
+        if not isinstance(cause_key, str) or not _BLOCK_CAUSE_KEY.fullmatch(cause_key):
+            raise ValueError("cause_key must be 1-128 ASCII letters/digits or . _ : -")
+    if upstream_task_id is not None:
+        if not isinstance(upstream_task_id, str) or not upstream_task_id.strip():
+            raise ValueError("upstream_task_id must be a nonblank task id")
+        upstream_task_id = upstream_task_id.strip()
+        if cause_key is None:
+            raise ValueError("upstream_task_id requires a nonblank cause_key")
+        if kind not in {"dependency", "needs_input"}:
+            raise ValueError("upstream_task_id is only valid for dependency or needs_input blocks")
+        # This CTE follows existing parent edges only. It cannot accidentally
+        # turn a prose mention or an unrelated board task into a dependency.
+        ancestor = conn.execute(
+            """
+            WITH RECURSIVE ancestors(id) AS (
+                SELECT parent_id FROM task_links WHERE child_id = ?
+                UNION
+                SELECT l.parent_id FROM task_links l JOIN ancestors a ON a.id = l.child_id
+            )
+            SELECT 1 FROM ancestors WHERE id = ? LIMIT 1
+            """,
+            (task_id, upstream_task_id),
+        ).fetchone()
+        if upstream_task_id == task_id or ancestor is None:
+            raise ValueError("upstream_task_id must name a real transitive ancestor of this task")
+    return cause_key, upstream_task_id
+
+
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
     *, event_extra: Optional[dict] = None,
@@ -2839,7 +2890,9 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       block_cause_key = NULL,
+                       block_upstream_task_id = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """
@@ -3263,7 +3316,8 @@ def edit_task(
 
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
-    kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    kind: Optional[str] = None, cause_key: Optional[str] = None,
+    upstream_task_id: Optional[str] = None, expected_run_id: Optional[int] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
@@ -3283,10 +3337,14 @@ def block_task(
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, block_kind, block_recurrences, block_cause_key, block_upstream_task_id "
+            "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
+        cause_key, upstream_task_id = _validate_block_identity(
+            conn, task_id, kind=kind, cause_key=cause_key, upstream_task_id=upstream_task_id,
+        )
         # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
         # ``block_kind`` and no ``blocked`` event -- the policy is the
         # supervisor's, not the kernel's -- but the transition guard below only
@@ -3298,15 +3356,17 @@ def block_task(
             if kind is None or expected_run_id is not None or _row_get(cur_row, "block_kind") is not None:
                 return False
             classified = conn.execute(
-                "UPDATE tasks SET block_kind = ?, block_recurrences = 1 "
+                "UPDATE tasks SET block_kind = ?, block_recurrences = 1, "
+                "block_cause_key = ?, block_upstream_task_id = ? "
                 "WHERE id = ? AND status = 'blocked' AND block_kind IS NULL "
                 "AND current_run_id IS NULL",
-                (kind, task_id),
+                (kind, cause_key, upstream_task_id, task_id),
             ).rowcount
             if classified != 1:
                 return False
             _append_event(conn, task_id, "blocked", {
                 "kind": kind, "reason": reason, "classified_in_place": True,
+                "cause_key": cause_key, "upstream_task_id": upstream_task_id,
             })
             return True
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
@@ -3322,6 +3382,9 @@ def block_task(
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
+            prev_cause_key=_row_get(cur_row, "block_cause_key"),
+            prev_upstream_task_id=_row_get(cur_row, "block_upstream_task_id"),
+            cause_key=cause_key, upstream_task_id=upstream_task_id,
         )
         if rekind_reason:
             payload["requested_kind"] = requested_kind
@@ -3358,6 +3421,8 @@ def block_task(
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
     prev_kind: Optional[str], prev_recurrences: int,
+    prev_cause_key: Optional[str], prev_upstream_task_id: Optional[str],
+    cause_key: Optional[str], upstream_task_id: Optional[str],
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
@@ -3372,16 +3437,29 @@ def _route_block(
     (un-typed None compares equal to a prior un-typed block). At
     ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
     """
-    payload = {"reason": reason, "kind": kind, "source_status": source_status}
+    payload = {
+        "reason": reason, "kind": kind, "cause_key": cause_key,
+        "upstream_task_id": upstream_task_id, "source_status": source_status,
+    }
     if kind == "dependency":
-        return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
-    recurrences = prev_recurrences + 1 if prev_kind == kind else 1
-    set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
-    payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
+        return (
+            "todo", "dependency_wait",
+            "block_kind = ?, block_cause_key = ?, block_upstream_task_id = ?",
+            (kind, cause_key, upstream_task_id), payload,
+        )
+    same_identity = (prev_kind, prev_cause_key, prev_upstream_task_id) == (
+        kind, cause_key, upstream_task_id,
+    )
+    recurrences = prev_recurrences + 1 if same_identity else 1
+    set_sql = (
+        "block_kind = ?, block_recurrences = ?, block_cause_key = ?, "
+        "block_upstream_task_id = ?"
+    )
+    payload["recurrences"] = recurrences
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
-        return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
-    return "blocked", "blocked", set_sql, (kind, recurrences), payload
+        return "triage", "block_loop_detected", set_sql, (kind, recurrences, cause_key, upstream_task_id), payload
+    return "blocked", "blocked", set_sql, (kind, recurrences, cause_key, upstream_task_id), payload
 
 
 def redact_review_value(value: Any) -> Any:
@@ -3825,7 +3903,9 @@ def invalidate_descendants_for_parent_reopen(
                 FROM task_links l
                 JOIN descendants d ON d.id = l.parent_id
             )
-            SELECT t.id, t.status, t.current_run_id, t.worker_pid, t.claim_lock, t.worker_started_at
+            SELECT t.id, t.status, t.assignee, t.completion_contract,
+                   t.block_upstream_task_id, t.current_run_id, t.worker_pid,
+                   t.claim_lock, t.worker_started_at
             FROM descendants d
             JOIN tasks t ON t.id = d.id
             ORDER BY t.id
@@ -3834,6 +3914,37 @@ def invalidate_descendants_for_parent_reopen(
         ).fetchall()
         for row in rows:
             previous_status = row["status"]
+            # Typed upstream provenance is an explicit assertion that THIS
+            # ancestor's implementation defect is the only blocker.  Unlike a
+            # generic triage card, it may safely re-enter normal parent gating.
+            # Never infer this from a title, a reason, or a stale event.
+            if (
+                previous_status in {"blocked", "triage"}
+                and row["block_upstream_task_id"] == task_id
+            ):
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo', claim_lock = NULL, claim_expires = NULL, "
+                    "worker_pid = NULL, worker_started_at = NULL, current_run_id = NULL, "
+                    "consecutive_failures = 0, last_failure_error = NULL, block_kind = NULL, "
+                    "block_recurrences = 0, block_cause_key = NULL, block_upstream_task_id = NULL "
+                    "WHERE id = ? AND status IN ('blocked', 'triage')",
+                    (row["id"],),
+                )
+                entry = {
+                    "id": row["id"], "prior_status": previous_status,
+                    "new_status": "todo", "resume_status": "ready",
+                    "typed_upstream_recovery": True,
+                }
+                _append_event(
+                    conn, row["id"], "upstream_rework_recovered",
+                    {"ancestor": task_id, **{k: v for k, v in entry.items() if k != "id"}},
+                )
+                _insert_comment(
+                    conn, row["id"], author,
+                    f"Recovered upstream rework wait: ancestor {task_id} reopened; returned to todo.", now,
+                )
+                invalidated.append(entry)
+                continue
             if previous_status not in {"ready", "review", "running", "done"}:
                 continue
             resume_status = "ready"
@@ -3849,33 +3960,59 @@ def invalidate_descendants_for_parent_reopen(
                 )
             # consecutive_failures = 0: deliberate operator reset — see
             # docstring for why this diverges from reopen_review_task.
-            conn.execute(
-                "UPDATE tasks SET status = 'todo', completed_at = NULL, "
+            restored_assignee = None
+            recovery_error = None
+            if previous_status == "done":
+                from hermes_cli.kanban_db_review_gate import durable_implementer, is_pr_backed_contract
+
+                if is_pr_backed_contract(row["completion_contract"]):
+                    restored_assignee, recovery_error = durable_implementer(conn, row["id"])
+            new_status = "todo" if recovery_error is None else "triage"
+            sql = (
+                "UPDATE tasks SET status = ?, completed_at = NULL, "
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                "current_run_id = NULL, consecutive_failures = 0 WHERE id = ?", (row["id"],),
+                "current_run_id = NULL, consecutive_failures = 0, last_failure_error = NULL "
+                + (", assignee = ?" if restored_assignee else "")
+                + " WHERE id = ?"
             )
+            params: tuple[Any, ...] = (new_status, *((restored_assignee,) if restored_assignee else ()), row["id"])
+            conn.execute(sql, params)
             entry = {
-                "id": row["id"], "prior_status": previous_status,
-                "new_status": "todo", "resume_status": resume_status,
+                "id": row["id"], "prior_status": previous_status, "new_status": new_status,
+                "resume_status": resume_status,
             }
+            if restored_assignee:
+                entry["previous_assignee"] = row["assignee"]
+                entry["restored_assignee"] = restored_assignee
+            if recovery_error:
+                entry["recovery_error"] = recovery_error
+                entry["recovery"] = "repair durable review provenance before rework dispatch"
             _append_event(
                 conn, row["id"], "descendant_invalidated",
                 {"ancestor": task_id, **{k: v for k, v in entry.items() if k != "id"}},
                 run_id=run_id,
             )
+            if restored_assignee:
+                # The approval remains history, not authority.  This is a new
+                # review boundary, so completion_gate_reason demands a fresh
+                # same-card review after the reworked implementation run.
+                _append_event(
+                    conn, row["id"], "rework_requested",
+                    {"ancestor": task_id, "implementer": restored_assignee, "prior_status": previous_status},
+                )
             # Legacy 'status' event so existing live-feed consumers still see
             # the move without learning the new event kind.
             _append_event(
                 conn, row["id"], "status",
                 {
-                    "status": "todo", "reason": "ancestor_reopened", "parent": task_id,
+                    "status": new_status, "reason": "ancestor_reopened", "parent": task_id,
                     "previous_status": previous_status, "resume_status": resume_status,
                 },
                 run_id=run_id,
             )
             _insert_comment(
                 conn, row["id"], author, f"Invalidated: ancestor {task_id} was reopened; "
-                f"retracted from '{previous_status}' to 'todo' "
+                f"retracted from '{previous_status}' to '{new_status}' "
                 f"(will resume via '{resume_status}').", now,
             )
             invalidated.append(entry)

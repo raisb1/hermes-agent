@@ -341,6 +341,12 @@ _SPECS = [
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _arg("--cause-key", metavar="KEY",
+             help="Stable 1-128 character machine cause id (letters/digits plus . _ : -). "
+                  "Changes recurrence identity; omit for legacy kind-only behavior."),
+        _arg("--upstream-task-id", metavar="TASK_ID",
+             help="Explicit incomplete transitive ancestor causing this dependency/needs-input wait. "
+                  "Requires --cause-key; does not create a graph edge."),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
@@ -371,6 +377,13 @@ _SPECS = [
         _arg("--reason", required=True,
              help="Nonblank operator reason for reopening an approved implementation"),
     ], help="Return a done implementation to its original coder and invalidate downstream work"),
+    _cmd("recover-upstream-rework", [
+        _TASK_ID,
+        _arg("--upstream-task-id", required=True, metavar="TASK_ID",
+             help="Incomplete transitive ancestor whose rework blocks this legacy task"),
+        _arg("--reason", required=True,
+             help="Nonblank operator reason; stored redacted in the audit trail"),
+    ], help="Explicitly recover a legacy blocked/triage upstream-rework wait into todo"),
     _cmd("promote", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),

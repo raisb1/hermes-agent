@@ -58,6 +58,11 @@ def _durable_implementer(conn: sqlite3.Connection, task_id: str) -> tuple[Option
     return implementer, None
 
 
+def durable_implementer(conn: sqlite3.Connection, task_id: str) -> tuple[Optional[str], Optional[str]]:
+    """Public, fail-closed lookup for original PR implementation ownership."""
+    return _durable_implementer(conn, task_id)
+
+
 def _active_run_profile(conn: sqlite3.Connection, task_id: str, run_id: Optional[int]) -> Optional[str]:
     if run_id is None:
         return None
