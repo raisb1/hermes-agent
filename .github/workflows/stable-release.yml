@@ -406,7 +406,7 @@ jobs:
     # The recorded smoke results are the calls' own workflow results: a
     # call's stable-phase-result fails when its smokes fail, so a failed
     # smoke fails this job's RELEASE_NEEDS check and stages no manifest.
-    if: always() && fromJSON(needs.admit.outputs.jobs)['candidate-manifest']
+    if: always() && github.repository == 'NousResearch/hermes-agent' && fromJSON(needs.admit.outputs.jobs)['candidate-manifest']
     needs: [admit, candidates-darwin-arm64, candidates-darwin-x64, candidates-win32-arm64,
             candidates-win32-x64, candidates-win32-bundle, candidates-termux]
     runs-on: ubuntu-latest
@@ -531,7 +531,7 @@ jobs:
 
   acceptance:
     name: All release acceptance checks pass
-    if: always()
+    if: always() && github.repository == 'NousResearch/hermes-agent'
     needs: [admit, ci, docker, nix, pm-bundle, termux-checks, windows-live, install-e2e,
             candidates-darwin-arm64, candidates-darwin-x64, candidates-win32-arm64,
             candidates-win32-x64, candidates-win32-bundle, candidates-termux,
@@ -591,7 +591,7 @@ jobs:
 
   publication:
     name: All artifact publication succeeded
-    if: always()
+    if: always() && github.repository == 'NousResearch/hermes-agent'
     needs: [admit, acceptance, publish-docker, publish-bundles]
     runs-on: ubuntu-latest
     steps:
@@ -608,7 +608,7 @@ jobs:
 
   complete:
     name: Stable release is green
-    if: always()
+    if: always() && github.repository == 'NousResearch/hermes-agent'
     needs: [admit, ci, docker, acceptance, candidate-manifest, publication, publish-docker,
             windows-packaged, macos-packaged-arm64, macos-packaged-x64]
     # GitHub-hosted with docker/setup-buildx-action, as before the runner migration: on

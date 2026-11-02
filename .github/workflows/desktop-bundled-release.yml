@@ -219,6 +219,7 @@ env:
 jobs:
   validate:
     name: Pre-build setup
+    if: github.repository == 'NousResearch/hermes-agent'
     # One dispatch: in disposable mode the allocation steps run first (the
     # channel pin comes from them), then admission validates the build source.
     # A failed allocation fails this job and skips everything downstream.
@@ -2503,7 +2504,7 @@ jobs:
 
   stable-phase-result:
     name: Stable bundle phase completed
-    if: always() && inputs.release-phase != ''
+    if: always() && github.repository == 'NousResearch/hermes-agent' && inputs.release-phase != ''
     needs:
       [
         validate,
