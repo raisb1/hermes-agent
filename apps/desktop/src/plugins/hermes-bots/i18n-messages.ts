@@ -171,6 +171,7 @@ export type BotsMessages = {
     attentionBlocked: string
     duplicate: string
     duplicateFailed: string
+    taskHistory: string
     deleteTitle: string
     removeFromAllGroups: string
     createFirstHint: string
