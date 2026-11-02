@@ -53,6 +53,7 @@ def test_release_controllers_refuse_the_fork():
         ("desktop-bundled-release.yml", "validate", {}),
         ("stable-release-publication.yml", "reconcile", {"event_name": "workflow_dispatch"}),
         ("canary-release.yml", "tag", {"ref_name": "main", "event": {"repository": {"default_branch": "main"}}}),
+        ("js-autofix.yml", "generate-patch", {}),
     ]
     for filename, job, event in cases:
         expression = workflow(filename)["jobs"][job]["if"]
