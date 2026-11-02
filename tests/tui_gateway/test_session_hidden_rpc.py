@@ -101,7 +101,7 @@ def test_session_list_default_keeps_kanban_rows_hidden_from_human_listing(db):
     rows = _call("session.list", {})["result"]["sessions"]
 
     assert {row["id"] for row in rows} == {"desktop-chat"}
-    assert set(rows[0]) == {"id", "title", "preview", "started_at", "message_count", "source"}
+    assert set(rows[0]) == {"id", "title", "preview", "started_at", "message_count", "source", "_lineage_root_id"}
     assert rows[0]["source"] == "desktop"
 
 
