@@ -808,6 +808,10 @@ def _complete_source_update(request: dict | None) -> None:
         raise SystemExit(130) from interrupt
     except Exception as exc:  # health: allow BLE001 -- after the commit point a lost completion is owed, never a failed update (C3)
         result, lost = settle_lost_completion(request, f"{type(exc).__name__}: {exc}"), True
+    if not lost and result.get("custody_refused"):
+        # The child could not own the checkout; lost-completion settlement would write under
+        # another updater's lock. Report the refusal instead of fabricating a settled tail.
+        raise SystemExit(result["exit_code"] or 1)
     if not lost and result.get("receipt") is None and result["exit_code"] == 130:
         _completion_receipt.finalize_interrupted_update_receipt("the completion was interrupted after the code was updated")
     elif not lost and result.get("receipt") is None and result["exit_code"]:

@@ -28,16 +28,36 @@ def test_bootstrap_refuses_before_mutation_if_checkout_is_owned(tmp_path, monkey
     try:
         assert owner.stdout.readline().strip() == "ready"
         from hermes_cli import venv_sync
-        mutated = []
-        monkeypatch.setattr(venv_sync, "arm_completion", lambda _: mutated.append(True))
-        with pytest.raises(RuntimeError, match="checkout lock"):
-            update_completion._prepare({"source": str(root), "receipt": {"update_id": "test"}},
-                                       tmp_path / "request", tmp_path / "result")
-        assert mutated == []
+        pending = venv_sync.completion_pending_path(root)
+        terminal = {"outcome": "success", "update_id": "test", "finished_at": "synthetic"}
+        monkeypatch.setattr(update_completion, "_read_terminal_receipt", lambda _: terminal)
+        code = update_completion._bootstrap({"source": str(root), "receipt": {"update_id": "test"}},
+                                            tmp_path / "request", tmp_path / "result")
+        assert code != 0
+        assert not pending.exists()
+        assert owner.poll() is None
     finally:
         owner.stdin.close()
         owner.wait(timeout=10)
         owner.stdout.close()
+
+
+def test_dependency_failure_after_custody_still_arms_owed_tail(tmp_path, monkeypatch):
+    from hermes_cli import venv_sync
+    from pm import client
+
+    root = tmp_path / "checkout"
+    root.mkdir()
+    def fail_tools():
+        raise RuntimeError("synthetic dependency failure")
+    monkeypatch.setattr(client, "ensure_tools_for_sync", fail_tools)
+    monkeypatch.setattr("hermes_cli.gitlock.convert_treeless_checkout_first", lambda _: None)
+    monkeypatch.setattr("pm.receipt.last_for_update", lambda _: None)
+    terminal = {"outcome": "success", "update_id": "test", "finished_at": "synthetic"}
+    monkeypatch.setattr(update_completion, "_read_terminal_receipt", lambda _: terminal)
+    request = {"source": str(root), "receipt": {"update_id": "test"}}
+    assert update_completion._bootstrap(request, tmp_path / "request", tmp_path / "result") == 0
+    assert venv_sync.completion_pending_path(root).exists()
 
 
 @pytest.mark.platforms("posix")

@@ -318,6 +318,10 @@ def _settle_after_commit(request: dict, result_path: Path, step: str, reason: st
     return _write_bootstrap_result(request, result_path, code, receipt)
 
 
+class _CheckoutCustodyRefused(RuntimeError):
+    """Completion must not settle or modify state without checkout custody."""
+
+
 def _prepare(request: dict, request_path: Path, result_path: Path) -> int:
     import pm
     from pm import receipt
@@ -333,8 +337,8 @@ def _prepare(request: dict, request_path: Path, result_path: Path) -> int:
 
     refused = _acquire_checkout(root)
     if refused is not None:
-        raise RuntimeError("could not join the update's checkout lock "
-                           f"({refused.reason or f'held by process {refused.pid}'})")
+        raise _CheckoutCustodyRefused("could not join the update's checkout lock "
+                                      f"({refused.reason or f'held by process {refused.pid}'})")
     from hermes_cli.venv_sync import arm_completion, collect_superseded_generations
 
     # The foreign-owned-venv refusal runs in the parent BEFORE the swap (update_cmd_commit
@@ -567,6 +571,14 @@ def _bootstrap(request: dict, request_path: Path, result_path: Path) -> int:
     """Dependency preparation in the parent's interpreter; its failure is a follow-up (A6)."""
     try:
         return _prepare(request, request_path, result_path)
+    except _CheckoutCustodyRefused as exc:
+        # Settlement writes PM state and receipts, so it cannot run under another owner's lock.
+        print(f"  ⚠ Update completion refused: {exc}", flush=True)
+        _write_json(result_path, {
+            "schema": 1, "update_id": request["receipt"]["update_id"], "exit_code": 1,
+            "receipt": None, "windows_resume": None, "pm_receipt": None, "custody_refused": True,
+        })
+        return 1
     except KeyboardInterrupt:
         _resume_receipt(request["receipt"])
         from hermes_cli import update_receipt
