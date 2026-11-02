@@ -9,10 +9,16 @@ from ruamel.yaml import YAML
 
 from scripts.releases import lanes as lane_set
 
-from tests.ci.desktop_release_roles import gate
+from tests.ci.desktop_release_roles import gate as evaluate_gate
 from tests.ci.workflow_steps import is_checkout
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def gate(expression, inputs, needs, **options):
+    # The existing release-graph cases describe the upstream controller.
+    options.setdefault("github", {"repository": "NousResearch/hermes-agent"})
+    return evaluate_gate(expression, inputs, needs, **options)
 
 
 def workflow(name):
@@ -39,6 +45,19 @@ def ancestors(jobs, name):
 def test_admit_can_read_the_claim_draft():
     jobs = workflow("stable-release.yml")["jobs"]
     assert jobs["admit"]["permissions"]["contents"] == "write"
+
+
+def test_release_controllers_refuse_the_fork():
+    cases = [
+        ("stable-release.yml", "admit", {}),
+        ("desktop-bundled-release.yml", "validate", {}),
+        ("stable-release-publication.yml", "reconcile", {"event_name": "workflow_dispatch"}),
+        ("canary-release.yml", "tag", {"ref_name": "main", "event": {"repository": {"default_branch": "main"}}}),
+    ]
+    for filename, job, event in cases:
+        expression = workflow(filename)["jobs"][job]["if"]
+        assert gate(expression, {}, {}, github={**event, "repository": "NousResearch/hermes-agent"})
+        assert not gate(expression, {}, {}, github={**event, "repository": "raisb1/hermes-agent"})
 
 
 def test_release_reuses_whole_ci_and_docker_before_publication():
@@ -371,11 +390,12 @@ def test_publication_reconciler_has_every_recovery_trigger_and_shared_lock():
     # a manual dispatch of the reconciler always runs.
     def run_of(**overrides):
         workflow_run = {"conclusion": "failure", "event": "workflow_dispatch",
-                        "head_repository": {"full_name": "o/r"}, **overrides}
-        return {"event_name": "workflow_run", "repository": "o/r", "event": {"workflow_run": workflow_run}}
+                        "head_repository": {"full_name": "NousResearch/hermes-agent"}, **overrides}
+        return {"event_name": "workflow_run", "repository": "NousResearch/hermes-agent", "event": {"workflow_run": workflow_run}}
 
     assert gate(reconcile["if"], {}, {}, github=run_of())
-    assert gate(reconcile["if"], {}, {}, github={"event_name": "workflow_dispatch"})
+    assert gate(reconcile["if"], {}, {}, github={"event_name": "workflow_dispatch", "repository": "NousResearch/hermes-agent"})
+    assert not gate(reconcile["if"], {}, {}, github={"event_name": "workflow_dispatch", "repository": "raisb1/hermes-agent"})
     for refused in ({"conclusion": "success"}, {"event": "push"}, {"head_repository": {"full_name": "fork/r"}}):
         assert not gate(reconcile["if"], {}, {}, github=run_of(**refused)), refused
     checkout = reconcile["steps"][0]
