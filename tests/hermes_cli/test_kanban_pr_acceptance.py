@@ -288,7 +288,7 @@ def test_policy_rejections_leave_task_identity_and_state_unchanged(github):
     with connect() as conn:
         local = kb.create_task(conn, title="local", completion_contract="local-only")
         terminal = kb.create_task(conn, title="terminal", completion_contract=contract)
-        assert kb.complete_task(conn, terminal, metadata={"published_pr": contract})
+        assert kb.complete_task(conn, terminal, result="Verified test PR", metadata={"published_pr": contract})
         mutable = kb.create_task(conn, title="mutable", completion_contract=contract)
         tasks = {task_id: _task(conn, task_id) for task_id in (local, terminal, mutable)}
         before = {
@@ -337,8 +337,8 @@ def test_first_published_pr_binds_contract_and_rejects_a_sibling_pr(github):
     github["conclusion"] = "failure"
     with connect() as conn:
         task_id = kb.create_task(conn, title="publish", completion_contract="acme/repo")
-        assert not kb.complete_task(conn, task_id, metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
-        assert not kb.complete_task(conn, task_id, metadata={"published_pr": "https://github.com/acme/repo/pull/8"})
+        assert not kb.complete_task(conn, task_id, result="Verified test PR", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        assert not kb.complete_task(conn, task_id, result="Verified test PR", metadata={"published_pr": "https://github.com/acme/repo/pull/8"})
         task = _task(conn, task_id)
     assert task.completion_contract == "https://github.com/acme/repo/pull/7"
 
@@ -358,7 +358,7 @@ def test_policy_change_during_acceptance_cannot_commit_stale_evidence(github):
                 )
 
         github["race"] = change_policy
-        assert not kb.complete_task(conn, task_id, expected_run_id=owner.current_run_id,
+        assert not kb.complete_task(conn, task_id, result="Verified test PR", expected_run_id=owner.current_run_id,
                                     metadata={"published_pr": contract})
         task = _task(conn, task_id)
         receipts = conn.execute(
@@ -429,7 +429,8 @@ def test_only_exact_rules_plan_response_is_sanitized_as_unavailable(github, stat
         assert receipt["classification"] == "no-required-checks"
         assert receipt["ruleset_unavailable"] is True
     else:
-        assert receipt["classification"] == "infra"
+        assert not receipt["ok"]
+        assert receipt["classification"] == "auth"
 
 
 @pytest.mark.platforms("linux")
