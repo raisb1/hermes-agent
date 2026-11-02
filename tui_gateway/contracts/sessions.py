@@ -222,6 +222,7 @@ class SessionListParams(ProfileParams):
     title: str | None = None  # exact-title lookup (title as identity); windowless
     limit: int | None = None
     include_hidden: bool = False
+    sources: list[str] | str | None = None
 
 
 class SessionListRow(Result):

@@ -41,6 +41,7 @@ env:
 jobs:
   windows-x64:
     name: Hermes-Setup.exe (windows x64, signed)
+    if: github.repository == 'NousResearch/hermes-agent'
     runs-on: windows-latest
     environment: release-signing
     timeout-minutes: 90
@@ -151,6 +152,7 @@ jobs:
 
   macos-arm64:
     name: Hermes-Setup.dmg (macos arm64, signed + notarized)
+    if: github.repository == 'NousResearch/hermes-agent'
     runs-on: macos-latest
     environment: release-signing
     timeout-minutes: 90

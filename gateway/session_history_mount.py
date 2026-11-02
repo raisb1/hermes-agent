@@ -28,18 +28,26 @@ def _reader(authority, actor, sid):
             or getattr(authority, '_native_legacy_transports', {}).get(actor.transport_id) == actor)
 
 
-def mount_history(authority, actor, sid):
-    """Mount *sid* read-only for its owner; False when another loader owns it or the actor may not."""
+def history_mountable(authority, actor, sid):
+    """Check the read-only mount's ownership and profile rules without changing runtime state."""
     from hermes_state_local import API_BINDING_PREFIX
     from hermes_state_local_migration import LEGACY_LOCAL_SOURCES
     row = authority.db.get_session(sid)
-    if (row['source'] in LEGACY_LOCAL_SOURCES | {'local'}
+    if (row is None or actor.profile_id != authority.profile_id or 'session:read' not in actor.capabilities
+            or row['source'] in LEGACY_LOCAL_SOURCES | {'local'}
             or row.get('profile_name') not in (None, '', authority.db._own_profile_name() or 'default')
             or not _reader(authority, actor, sid)):
         return False
     with authority.db._read_ctx() as conn:
         if conn.execute('SELECT 1 FROM state_meta WHERE key=?', (API_BINDING_PREFIX + sid,)).fetchone():
             return False  # restore_api_session's
+    return True
+
+
+def mount_history(authority, actor, sid):
+    """Mount *sid* read-only for its owner; False when another loader owns it or the actor may not."""
+    if not history_mountable(authority, actor, sid):
+        return False
     authority._require_admission_open()
     from gateway.session_authority import LiveSession
     authority.sessions.setdefault(sid, LiveSession(None, _ROUTE_PREFIX + sid))

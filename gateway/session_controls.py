@@ -562,8 +562,14 @@ class AuthorityConnection:
         if 'session:read' not in self.actor.capabilities:
             raise RuntimeStoreError('permission_denied')
         limit = params.get('limit', 200)
-        if set(params) - {'limit', 'title', 'include_hidden', 'scope'} or type(limit) is not int or not 1 <= limit <= 200:
+        if set(params) - {'limit', 'title', 'include_hidden', 'scope', 'sources'} or type(limit) is not int or not 1 <= limit <= 200:
             raise RuntimeStoreError('invalid_params')
+        if 'sources' in params:
+            if params['sources'] != ['kanban'] or 'title' in params or params.get('scope', 'stored') != 'stored':
+                raise RuntimeStoreError('invalid_params')
+            from gateway.session_listing import stored_kanban_sessions
+            return await asyncio.to_thread(stored_kanban_sessions, self.authority, self.actor,
+                limit=limit, include_hidden=params.get('include_hidden', False))
         if params.get('scope', 'live') not in {'live', 'stored'} or ('title' in params and 'scope' in params):
             raise RuntimeStoreError('invalid_params')
         if params.get('scope') == 'stored':

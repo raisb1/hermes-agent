@@ -24,6 +24,31 @@ def _picker_row(row, tip, sid):
             'message_count': row.get('message_count', 0), 'model': tip.get('model'), 'running': False}
 
 
+def stored_kanban_sessions(authority, actor, *, limit, include_hidden=False):
+    """Discover only history the existing read-only mount will admit, without mounting it."""
+    from gateway.session_history_mount import history_mountable
+    if actor.profile_id != authority.profile_id:
+        raise RuntimeStoreError('profile_mismatch')
+    if 'session:read' not in actor.capabilities:
+        raise RuntimeStoreError('permission_denied')
+    db = authority.db
+    sessions, offset = [], 0
+    while len(sessions) < limit:
+        rows = db.list_sessions_rich(sources=['kanban'], limit=200, offset=offset,
+            order_by_last_active=True, compact_rows=True, include_hidden=include_hidden)
+        for row in rows:
+            sid = db.get_compression_tip(row['id']) or row['id']
+            tip = db.get_session(sid)
+            if tip and history_mountable(authority, actor, sid):
+                sessions.append(_picker_row(row, tip, sid))
+                if len(sessions) == limit:
+                    break
+        if len(rows) < 200:
+            break
+        offset += len(rows)
+    return {'sessions': sessions, 'scope': 'stored'}
+
+
 def stored_picker_sessions(authority, actor, *, limit, include_hidden=False):
     """Offer legacy local rows only to the same native transport that may resume them.
 

@@ -115,6 +115,14 @@ def test_session_list_sources_opt_in_returns_only_requested_denied_source(db):
     assert {row["id"] for row in rows} == {"kanban-worker"}
 
 
+def test_session_list_sources_passes_real_rpc_admission(db):
+    _seed(db, "kanban-worker", source="kanban")
+    _seed(db, "tool-worker", source="tool")
+    reply = srv.handle_request({"jsonrpc": "2.0", "id": 1, "method": "session.list",
+                                "params": {"sources": ["kanban"], "include_hidden": True, "limit": 200}})
+    assert {row["id"] for row in reply["result"]["sessions"]} == {"kanban-worker"}
+
+
 def test_session_list_sources_accepts_a_single_string(db):
     _seed(db, "kanban-worker", source="kanban")
 

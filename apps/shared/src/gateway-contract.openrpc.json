@@ -8850,6 +8850,22 @@
             "default": false,
             "title": "Include Hidden",
             "type": "boolean"
+          },
+          "sources": {
+            "anyOf": [
+              {
+                "items": {
+                  "const": "kanban",
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sources"
           }
         },
         "title": "CanonicalListParams",
@@ -37592,6 +37608,24 @@
             "default": false,
             "title": "Include Hidden",
             "type": "boolean"
+          },
+          "sources": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sources"
           }
         },
         "title": "SessionListParams",

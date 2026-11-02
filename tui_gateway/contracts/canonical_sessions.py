@@ -166,6 +166,7 @@ class CanonicalListParams(ProfileParams):
     limit: int = 200
     title: str | None = None
     include_hidden: bool = False
+    sources: list[Literal['kanban']] | None = None
 
 
 class CanonicalSessionListRow(Result):

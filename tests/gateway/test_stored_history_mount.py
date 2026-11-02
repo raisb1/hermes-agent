@@ -14,6 +14,7 @@ from gateway.session_contract import SessionRef
 from hermes_state_runtime import RuntimeStoreError
 
 ROWS = {
+    'kanban-1': ('kanban', {}),
     'cron_job1_20261001_120000': ('cron', {}),
     'sub-1': ('subagent', {}),
     'api-1': ('api_server', {'session_key': 'agent:main:api_server:dm:api-1', 'chat_id': 'api-1'}),
@@ -59,6 +60,39 @@ async def test_old_stored_history_opens_read_only_for_its_owner(tmp_path, monkey
     with pytest.raises(RuntimeStoreError, match='session_read_only'):
         await conn.submit(ref, {'text': 'more', 'submission_id': 's1'})
     assert conn.authority.db.get_session(sid)['message_count'] == 2
+
+
+@pytest.mark.asyncio
+async def test_kanban_history_admission_lists_and_opens_only_for_owner(tmp_path, monkeypatch):
+    conn, ref = await _connect(tmp_path, monkeypatch, 'kanban-1')
+    db = conn.authority.db
+    db.create_session('tool-1', source='tool')
+    db.append_message('tool-1', role='user', content='private')
+    db.create_session('foreign-profile', source='kanban')
+    db.append_message('foreign-profile', role='user', content='foreign')
+    db._write_sql('UPDATE sessions SET profile_name=? WHERE id=?', ('another-profile', 'foreign-profile'))
+    db.create_session('foreign-binding', source='kanban')
+    db.append_message('foreign-binding', role='user', content='foreign')
+    from hermes_state_mutation_binding import BINDING_PREFIX
+    binding = json.dumps([conn.authority.profile_id, 'uid:999999'], separators=(',', ':'))
+    db._write_sql('INSERT INTO state_meta(key,value) VALUES(?,?)', (BINDING_PREFIX + 'foreign-binding', binding))
+    async def call(connection, method, **params):
+        return await connection.dispatch({'id': 1, 'method': method, 'params': params})
+
+    assert not (await call(conn, 'session.list'))['result']['sessions']
+    listed = await call(conn, 'session.list', sources=['kanban'], include_hidden=True, limit=200)
+    assert [row['id'] for row in listed['result']['sessions']] == ['kanban-1']
+    assert 'kanban-1' not in conn.authority.sessions
+    opened = await call(conn, 'session.resume', session_id=ref.session_id)
+    assert [row['content'] for row in opened['result']['messages']] == ['q', 'a']
+    denied = await call(conn, 'prompt.submit', session_id=ref.session_id, text='more', submission_id='s1')
+    assert denied['error']['message'] == 'session_read_only'
+    from gateway.session_controls import AuthorityConnection
+    stranger = AuthorityConnection(conn.authority, object(), {'user_id': 'stranger'})
+    assert not (await call(stranger, 'session.list', sources=['kanban']))['result']['sessions']
+    assert 'error' in await call(stranger, 'session.resume', session_id=ref.session_id)
+    assert 'error' in await call(conn, 'session.list', sources=['tool'])
+    assert 'error' in await call(conn, 'session.list', sources=['kanban'], profile='foreign-profile')
 
 
 @pytest.mark.asyncio
