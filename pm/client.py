@@ -122,8 +122,11 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
     stopped = threading.Event()
     write_lock = threading.Lock()
     monitor = None
-    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          text=True, encoding="utf-8", env=environment) as process:
+    from hermes_cli.update_custody import contained_command
+
+    with contained_command(command) as (command, custody), subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True, encoding="utf-8", env=environment, **custody) as process:
         assert process.stdin is not None and process.stdout is not None
         writer = process.stdin
 

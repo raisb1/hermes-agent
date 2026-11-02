@@ -181,11 +181,12 @@ def _read_pipe(fd: int) -> bytes:
 
 
 def _run_streaming(command: list[str], *, cwd: Path, env: dict[str, str],
-                   timeout: int, output: TextSink) -> subprocess.CompletedProcess:
+                   timeout: int, output: TextSink, custody: dict | None = None) -> subprocess.CompletedProcess:
     """Keep CI progress live, a bounded diagnostic tail, and a wall-clock timeout."""
     deadline = time.monotonic() + timeout
     proc = subprocess.Popen(command, cwd=native(cwd), env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=0)
+                            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=0,
+                            **(custody or {}))
     pipe = proc.stdout
     assert isinstance(pipe, io.TextIOWrapper)  # Popen was given stdout=PIPE and text=True.
     tail = ""
@@ -233,6 +234,18 @@ def _run_streaming(command: list[str], *, cwd: Path, env: dict[str, str],
     if conflict and conflict not in tail.lower():
         tail = conflict + "\n" + tail[-(2000 - len(conflict) - 1):]
     return subprocess.CompletedProcess(command, code, "", tail)
+
+
+def _run_uv(command, *, cwd, env, timeout, output=None):
+    # PM can bootstrap its own runtime before the worker is started. Fence this
+    # boundary too, but contained_command is a no-op for ordinary standalone PM.
+    from hermes_cli.update_custody import contained_command
+
+    with contained_command(command) as (argv, custody):
+        if output is not None:
+            return _run_streaming(argv, cwd=cwd, env=env, timeout=timeout, output=output, **({"custody": custody} if custody else {}))
+        return subprocess.run(argv, cwd=native(cwd), env=env, capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False, **custody)
 
 
 def _base_environment(env: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -345,14 +358,14 @@ class PythonEnvironment:
                     # build frontend, so only the backend's own lines reach the user.
                     command.append("--verbose")
                     env.setdefault("RUST_LOG", "uv_build_frontend=debug")
-                    return _run_streaming(command, cwd=cwd, env=env, timeout=timeout, output=self.output)
+                    return _run_uv(command, cwd=cwd, env=env, timeout=timeout, output=self.output)
                 if self.output is not None:
                     # uv prints backend output on failure anyway; interactive users see
                     # one live status line and the captured tail only if it fails.
                     tail = LiveTail(_UV_LABELS.get(tuple(args[:2]), _UV_LABELS.get(args[0])),
                                     self.output, indent="  ")
                     try:
-                        result = _run_streaming(command, cwd=cwd, env=env, timeout=timeout, output=tail)
+                        result = _run_uv(command, cwd=cwd, env=env, timeout=timeout, output=tail)
                     except BaseException:
                         tail.close(False)
                         raise
@@ -363,8 +376,7 @@ class PythonEnvironment:
                     else:
                         tail.close(result.returncode == 0)
                     return result
-                return subprocess.run(command, cwd=native(cwd), env=env, capture_output=True,
-                                      text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False)
+                return _run_uv(command, cwd=cwd, env=env, timeout=timeout)
             except subprocess.TimeoutExpired as exc:
                 from pm.index_config import TIMEOUT_HINT
 
