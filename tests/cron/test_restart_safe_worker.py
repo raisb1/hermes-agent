@@ -362,6 +362,45 @@ def test_launch_external_worker_treats_a_routed_fire_as_multiplexed(tmp_path, mo
     assert os.environ["LAUNCH_ONLY_SECRET"] == "launch-secret"  # parent untouched
 
 
+def test_external_worker_env_follows_profile_a_b_a(tmp_path, monkeypatch):
+    from agent import secret_scope
+    from cron import scheduler
+    from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
+    from tools.env_passthrough import clear_env_passthrough, register_env_passthrough
+    from tools.process_registry import GatewayChildDispatch
+
+    homes = [tmp_path / "a", tmp_path / "b"]
+    for home, value in zip(homes, ("alpha-synthetic", "beta-synthetic")):
+        home.mkdir()
+        (home / ".env").write_text(f"SERVICE_TOKEN={value}\n", encoding="utf-8")
+    monkeypatch.setenv("SERVICE_TOKEN", "launch-synthetic")
+    monkeypatch.setattr(scheduler, "_get_hermes_home", get_hermes_home)
+    monkeypatch.setattr(
+        "tools.process_registry.restart_safe_gateway_child_argv",
+        lambda command, **_kw: GatewayChildDispatch("scoped", ["scope", "--", *command]),
+    )
+    register_env_passthrough(["SERVICE_TOKEN"])
+    secret_scope.set_multiplex_active(True)
+    observed = []
+    try:
+        for home in (homes[0], homes[1], homes[0]):
+            spawned, payloads, _, _ = _stub_external_worker_launch(scheduler, monkeypatch)
+            token = set_hermes_home_override(str(home))
+            try:
+                assert scheduler._launch_external_cron_worker(
+                    {"id": "job", "execution_id": "exec-1", "prompt": "work"})
+            finally:
+                reset_hermes_home_override(token)
+            observed.append(spawned[0][1]["env"]["SERVICE_TOKEN"])
+            assert payloads[0]["profile_home"] == str(home.resolve())
+            assert secret_scope.current_secret_scope() is None
+        assert observed == ["alpha-synthetic", "beta-synthetic", "alpha-synthetic"]
+        assert os.environ["SERVICE_TOKEN"] == "launch-synthetic"
+    finally:
+        clear_env_passthrough()
+        secret_scope.set_multiplex_active(False)
+
+
 def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
     tmp_path, monkeypatch
 ):
