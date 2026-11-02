@@ -33,6 +33,7 @@ concurrency:
 jobs:
   admit:
     name: Admit the claim
+    if: github.repository == 'NousResearch/hermes-agent'
     # A read token cannot see a draft release, so gh release view answers
     # "release not found" for a draft that exists. Write is the permission
     # that can read it.

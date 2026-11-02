@@ -29,7 +29,7 @@ jobs:
     name: Tag, draft, and start the canary build
     runs-on: ubuntu-latest
     # A dispatch from a feature branch would tag unmerged code as the canary.
-    if: github.ref_name == github.event.repository.default_branch
+    if: github.repository == 'NousResearch/hermes-agent' && github.ref_name == github.event.repository.default_branch
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
