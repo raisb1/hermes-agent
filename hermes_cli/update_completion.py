@@ -326,18 +326,15 @@ def _prepare(request: dict, request_path: Path, result_path: Path) -> int:
 
     root = Path(request["source"])
     update_id = request["receipt"]["update_id"]
-    if sys.platform == "win32":
-        # Windows (review L3): a bootstrap child the update's job refused runs outside the job
-        # and outlives a killed owner, so it joins the checkout lock before anything below
-        # writes the checkout (uv's sync children, the generation collector): the join takes a
-        # lease byte of its own (R5b, as the --prepared child does in complete_source_checkout).
-        # Held until this bootstrap exits, after the --prepared child; the kernel drops it.
-        from hermes_cli.update_lock import _acquire_checkout
+    # Join an inherited lock, or take one when a legacy POSIX parent did not pass an fd.
+    # Windows joiners take a lease when the ancestor owns the lock. Hold custody until
+    # this bootstrap exits, after the prepared child; the kernel releases it on exit.
+    from hermes_cli.update_lock import _acquire_checkout
 
-        refused = _acquire_checkout(root)
-        if refused is not None:
-            raise RuntimeError("could not join the update's checkout lock "
-                               f"({refused.reason or f'held by process {refused.pid}'})")
+    refused = _acquire_checkout(root)
+    if refused is not None:
+        raise RuntimeError("could not join the update's checkout lock "
+                           f"({refused.reason or f'held by process {refused.pid}'})")
     from hermes_cli.venv_sync import arm_completion, collect_superseded_generations
 
     # The foreign-owned-venv refusal runs in the parent BEFORE the swap (update_cmd_commit
