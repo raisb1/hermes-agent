@@ -10,6 +10,7 @@ import pytest
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_rework as kbr
 
 
@@ -84,6 +85,14 @@ def test_parent_rework_restores_original_pr_implementer_and_requires_fresh_revie
     ok, reason = kb.complete_task(conn, descendant, expected_run_id=repair_b.current_run_id, with_reason=True)
     assert ok is False
     assert reason is not None and "kanban_request_review" in reason
+
+
+def test_completed_card_reopened_for_rework_bypasses_recent_success_guard(conn, monkeypatch):
+    task_id = _approved_pr(conn, monkeypatch, assignee="coder-a")
+    assert kbr.reopen_task_for_rework(
+        conn, task_id, reason="release found a bounded defect", author="operator",
+    ) == (True, "coder-a")
+    assert kbd.check_respawn_guard(conn, task_id) is None
 
 
 def test_typed_upstream_marker_recovers_only_matching_waits_and_preserves_stage_owner(conn):
