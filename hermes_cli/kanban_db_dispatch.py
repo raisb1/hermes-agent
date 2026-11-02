@@ -201,17 +201,17 @@ _recent_worker_exits: dict[int, tuple[int, float]] = {}
 # sentinel 75) is lost: the worker is classified ``unknown`` and the task takes
 # a crash strike for a quota wall. Holding the handle keeps the child out of
 # ``_active``; ``reap_worker_zombies`` polls these first so the status is ours.
-_live_worker_procs: "dict[int, subprocess.Popen]" = {}
+_live_worker_procs: dict[int, subprocess.Popen] = {}
 
 
-def _register_worker_proc(proc: "subprocess.Popen") -> None:
+def _register_worker_proc(proc: subprocess.Popen) -> None:
     if proc.pid and proc.pid > 0:
         _live_worker_procs[int(proc.pid)] = proc
 
 
-def _reap_registered_workers() -> "list[int]":
+def _reap_registered_workers() -> list[int]:
     """Reap exited workers via their retained handles; record real exit codes."""
-    reaped: "list[int]" = []
+    reaped: list[int] = []
     for pid, proc in list(_live_worker_procs.items()):
         try:
             rc = proc.poll()
@@ -300,14 +300,14 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
     return int(matches[-1]) if matches else None
 
 
-def reap_worker_zombies() -> "list[int]":
+def reap_worker_zombies() -> list[int]:
     """Reap exited workers without blocking; returns reaped PIDs.
 
     Workers spawned by this process are reaped through their retained ``Popen``
     handles first (real exit status, see ``_live_worker_procs``); the
     ``waitpid(-1)`` sweep then covers anything else.
     """
-    reaped: "list[int]" = _reap_registered_workers()
+    reaped: list[int] = _reap_registered_workers()
     if os.name != "nt":
         try:
             while True:

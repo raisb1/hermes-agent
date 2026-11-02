@@ -189,10 +189,10 @@ def _steamos_glibc_header_env() -> dict[str, str] | None:
     import re
 
     try:
-        os_release = Path("/etc/os-release").read_text(encoding="utf-8")
+        os_release = Path("/etc/os-release").read_text(encoding="utf-8-sig")
     except OSError:
         return None
-    if not re.search(r"^ID=steamos$", os_release, re.M):
+    if not re.search(r"^ID=steamos$", os_release, re.MULTILINE):
         return None
 
     from hermes_platform.resolver.core import locate_command
@@ -217,7 +217,7 @@ def _steamos_glibc_header_env() -> dict[str, str] | None:
     cached_version = None
     if version_marker.exists():
         try:
-            cached_version = version_marker.read_text(encoding="utf-8").strip()
+            cached_version = version_marker.read_text(encoding="utf-8-sig").strip()
         except OSError:
             cached_version = None
 
