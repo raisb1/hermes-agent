@@ -199,7 +199,6 @@ def test_acceptance_race_rechecks_review_gate_before_receipt_or_completion(
 
     def invalidate_handoff(_conn, _task_id, _run_id, _metadata):
         assert kb.request_changes(conn, task_id, reason="late change", expected_run_id=reviewer.current_run_id) == (True, "builder")
-        return None
 
     monkeypatch.setattr("hermes_cli.kanban_pr_acceptance_store.prepare_acceptance", invalidate_handoff)
     ok, reason = kb.complete_task(conn, task_id, expected_run_id=reviewer.current_run_id, with_reason=True,

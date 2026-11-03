@@ -7,6 +7,7 @@ import pytest
 from ruamel.yaml import YAML
 
 from tests.ci.desktop_release_roles import DOWNLOADABLE_DISPATCHES, gate, needs_of
+from tests.ci.workflow_steps import is_checkout
 
 ROOT = Path(__file__).resolve().parents[2]
 R2_ENV = {"CLOUDFLARE_R2_ACCOUNT_ID", "CLOUDFLARE_R2_ACCESS_KEY_ID", "CLOUDFLARE_R2_SECRET_ACCESS_KEY", "CLOUDFLARE_R2_BUCKET"}
@@ -45,6 +46,10 @@ def test_archive_gate_uses_bootstrap_python_and_trusted_exact_revision():
     assert not {"pull_request", "pull_request_target"} & workflow["on"].keys()
     assert "workflow_dispatch" in workflow["on"] and "push" in workflow["on"]
     job = workflow["jobs"]["archive-inputs"]
+    for event in ('push', 'workflow_dispatch', 'workflow_call', 'pull_request', 'pull_request_target'):
+        for repo in ('NousResearch/hermes-agent', 'raisb1/hermes-agent'):
+            admitted = gate(job['if'], {}, {}, github={'repository': repo, 'event_name': event})
+            assert admitted is (repo == 'NousResearch/hermes-agent' and not event.startswith('pull_request'))
     assert job["environment"] == "release-signing"
     assert R2_ENV <= job["env"].keys()
     assert not any(s.get("uses") == "./.github/actions/setup-pm" for s in job["steps"])
@@ -65,8 +70,7 @@ def test_archive_gate_uses_bootstrap_python_and_trusted_exact_revision():
         assert not gate(archive["if"], {**DOWNLOADABLE_DISPATCHES["tag"], **skipped}, {}, job_if=False), skipped
     assert R2_ENV <= archive["env"].keys()
     assert validate["environment"] == "release-signing"
-    checkout = validate["steps"][0]
-    assert "actions/checkout" in checkout["uses"]
+    assert is_checkout(validate["steps"][0])
     assert not [name for name, job in release.items() if "archive-inputs" in needs_of(job)]
 
     action = YAML(typ="base").load((ROOT / ".github/actions/setup-pm/action.yml").read_text(encoding="utf-8"))
@@ -76,6 +80,15 @@ def test_archive_gate_uses_bootstrap_python_and_trusted_exact_revision():
     assert gate(archive["if"], {"archive-inputs": "true"}, {}, job_if=False)
     assert not gate(archive["if"], {"archive-inputs": "false"}, {}, job_if=False)
     assert archive_index < next(i for i, s in enumerate(steps) if s.get("id") == "install")
+
+
+def test_bootstrap_signing_jobs_refuse_forks():
+    jobs = load('bootstrap-installer-build.yml')['jobs']
+    for name in ('windows-x64', 'macos-arm64'):
+        job = jobs[name]
+        assert job['environment'] == 'release-signing'
+        assert gate(job['if'], {}, {}, github={'repository': 'NousResearch/hermes-agent'})
+        assert not gate(job['if'], {}, {}, github={'repository': 'raisb1/hermes-agent'})
 
 
 def test_scheduled_and_main_r2_consumers_skip_without_credentials():

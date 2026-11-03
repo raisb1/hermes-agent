@@ -114,7 +114,7 @@ class _RealCredentialWorkerCLI(CLIAgentSetupMixin):
         # Mirrors CLIChatTurnMixin.chat()'s first line: a credential failure
         # returns None before ever reaching run_conversation.
         if not self._ensure_runtime_credentials():
-            return None
+            return
         raise AssertionError("credential resolution should have failed in this test")
 
     def _print_exit_summary(self, clear_screen=True):

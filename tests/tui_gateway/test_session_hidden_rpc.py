@@ -14,7 +14,7 @@ Covers the two seams Bot Mode's "sessions are always hidden" policy leans on:
 import pytest
 
 import tui_gateway.server as srv
-import tui_gateway.methods_session  # noqa: F401  (registers the RPC methods)
+import tui_gateway.methods_session
 from hermes_state import SessionDB
 
 
@@ -101,7 +101,7 @@ def test_session_list_default_keeps_kanban_rows_hidden_from_human_listing(db):
     rows = _call("session.list", {})["result"]["sessions"]
 
     assert {row["id"] for row in rows} == {"desktop-chat"}
-    assert set(rows[0]) == {"id", "title", "preview", "started_at", "message_count", "source"}
+    assert set(rows[0]) == {"id", "title", "preview", "started_at", "message_count", "source", "_lineage_root_id"}
     assert rows[0]["source"] == "desktop"
 
 
@@ -113,6 +113,14 @@ def test_session_list_sources_opt_in_returns_only_requested_denied_source(db):
     rows = _call("session.list", {"sources": ["kanban"]})["result"]["sessions"]
 
     assert {row["id"] for row in rows} == {"kanban-worker"}
+
+
+def test_session_list_sources_passes_real_rpc_admission(db):
+    _seed(db, "kanban-worker", source="kanban")
+    _seed(db, "tool-worker", source="tool")
+    reply = srv.handle_request({"jsonrpc": "2.0", "id": 1, "method": "session.list",
+                                "params": {"sources": ["kanban"], "include_hidden": True, "limit": 200}})
+    assert {row["id"] for row in reply["result"]["sessions"]} == {"kanban-worker"}
 
 
 def test_session_list_sources_accepts_a_single_string(db):

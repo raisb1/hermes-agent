@@ -203,9 +203,11 @@ def _required_from_rules(pages: list) -> set[tuple[str, int | None]]:
 def _read_pr(repo: str, number: int, *,
              profile_home: str | None = None) -> tuple[str, str, set[tuple[str, int | None]]]:
     owner, name = repo.split("/")
-    query = '''{repository(owner:%s,name:%s){pullRequest(number:%d){headRefOid baseRefName state
-        baseRef{branchProtectionRule{requiredStatusChecks{context app{databaseId}}}}}}}''' % (
-            json.dumps(owner), json.dumps(name), number)
+    query = (
+        f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)})'
+        f'{{pullRequest(number:{number}){{headRefOid baseRefName state '
+        'baseRef{branchProtectionRule{requiredStatusChecks{context app{databaseId}}}}}}}'
+    )
     value = _api("graphql", query=query, profile_home=profile_home)
     try:
         repository = value["data"]["repository"]
